@@ -1,0 +1,243 @@
+using "2026"
+
+;; ══════════════════════════════════════════════════════════════════════════
+;;  BetterAI · optim — optimizers and learning-rate schedules (torch.optim)
+;;
+;;      let mut opt = optim::adam(0.01)
+;;      ...
+;;      let grads = autograd::backward(loss, model.parameters())
+;;      let r = opt.step(model, grads)          ;; PyTorch: opt.step()
+;;      model = r.model
+;;      opt = r.opt                              ;; carries momentum / Adam moments
+;;
+;;  Optimizer kinds: 1 SGD (+momentum, nesterov)  2 Adam  3 AdamW  4 RMSprop  5 Adagrad
+;; ══════════════════════════════════════════════════════════════════════════
+
+mod tensor
+mod nn
+
+use "std -> math" from "math"
+
+pub struct Optimizer is
+    pub kind: int
+    pub lr: f64
+    pub momentum: f64
+    pub beta1: f64
+    pub beta2: f64
+    pub eps: f64
+    pub weight_decay: f64
+    pub nesterov: bool
+    pub t: int
+    pub m: [[f64]]
+    pub v: [[f64]]
+end
+
+pub struct StepResult is
+    pub model: nn::Module
+    pub opt: Optimizer
+end
+
+pub struct ParamsResult is
+    pub params: [tensor::Tensor]
+    pub opt: Optimizer
+end
+
+fn base(kind: int, lr: f64) -> Optimizer is
+    return Optimizer {
+        kind: kind, lr: lr, momentum: 0.0, beta1: 0.9, beta2: 0.999, eps: 0.00000001,
+        weight_decay: 0.0, nesterov: false, t: 0, m: [], v: [],
+    }
+end
+
+;; stochastic gradient descent; momentum = 0.0 for plain SGD
+pub fn sgd(lr: f64, momentum: f64) -> Optimizer is
+    let o: Optimizer = base(1, lr)
+    return Optimizer {
+        kind: 1, lr: lr, momentum: momentum, beta1: o.beta1, beta2: o.beta2, eps: o.eps,
+        weight_decay: 0.0, nesterov: false, t: 0, m: [], v: [],
+    }
+end
+
+pub fn sgd_nesterov(lr: f64, momentum: f64) -> Optimizer is
+    let o: Optimizer = sgd(lr, momentum)
+    return Optimizer {
+        kind: 1, lr: lr, momentum: momentum, beta1: o.beta1, beta2: o.beta2, eps: o.eps,
+        weight_decay: 0.0, nesterov: true, t: 0, m: [], v: [],
+    }
+end
+
+pub fn adam(lr: f64) -> Optimizer is
+    return base(2, lr)
+end
+
+;; Adam with decoupled weight decay
+pub fn adamw(lr: f64, weight_decay: f64) -> Optimizer is
+    let o: Optimizer = base(3, lr)
+    return Optimizer {
+        kind: 3, lr: lr, momentum: 0.0, beta1: o.beta1, beta2: o.beta2, eps: o.eps,
+        weight_decay: weight_decay, nesterov: false, t: 0, m: [], v: [],
+    }
+end
+
+;; `alpha` is the smoothing constant of the squared-gradient average (PyTorch default 0.99)
+pub fn rmsprop(lr: f64, alpha: f64) -> Optimizer is
+    let o: Optimizer = base(4, lr)
+    return Optimizer {
+        kind: 4, lr: lr, momentum: alpha, beta1: o.beta1, beta2: o.beta2, eps: o.eps,
+        weight_decay: 0.0, nesterov: false, t: 0, m: [], v: [],
+    }
+end
+
+pub fn adagrad(lr: f64) -> Optimizer is
+    return base(5, lr)
+end
+
+;; copies of an optimizer with another learning rate / weight decay
+pub fn with_lr(o: Optimizer, lr: f64) -> Optimizer is
+    return Optimizer {
+        kind: o.kind, lr: lr, momentum: o.momentum, beta1: o.beta1, beta2: o.beta2, eps: o.eps,
+        weight_decay: o.weight_decay, nesterov: o.nesterov, t: o.t, m: o.m, v: o.v,
+    }
+end
+
+pub fn with_weight_decay(o: Optimizer, wd: f64) -> Optimizer is
+    return Optimizer {
+        kind: o.kind, lr: o.lr, momentum: o.momentum, beta1: o.beta1, beta2: o.beta2, eps: o.eps,
+        weight_decay: wd, nesterov: o.nesterov, t: o.t, m: o.m, v: o.v,
+    }
+end
+
+fn zeros_for(params: [tensor::Tensor]) -> [[f64]] is
+    let mut out: [[f64]] = []
+    for p in params is
+        let mut z: [f64] = []
+        let mut i: int = 0
+        while i < p.data.len() is
+            z.push(0.0)
+            i += 1
+        end
+        out.push(z)
+    end
+    return out
+end
+
+;; one optimisation step on a plain list of parameters
+pub fn step_params(o: Optimizer, params: [tensor::Tensor], grads: [tensor::Tensor]) -> ParamsResult is
+    if params.len() != grads.len() is
+        panic("betterai: optimizer: " + to_string(params.len()) + " parameters but " + to_string(grads.len()) + " gradients")
+    end
+    let mut ms: [[f64]] = o.m
+    let mut vs: [[f64]] = o.v
+    if ms.len() != params.len() is
+        ms = zeros_for(params)
+        vs = zeros_for(params)
+    end
+    let t: int = o.t + 1
+    let tf: f64 = t as f64
+    let bc1: f64 = 1.0 - math::pow(o.beta1, tf)
+    let bc2: f64 = 1.0 - math::pow(o.beta2, tf)
+    let mut out: [tensor::Tensor] = []
+    let mut nm: [[f64]] = []
+    let mut nv: [[f64]] = []
+    let mut k: int = 0
+    while k < params.len() is
+        let p: tensor::Tensor = params[k]
+        let g: tensor::Tensor = grads[k]
+        let m0: [f64] = ms[k]
+        let v0: [f64] = vs[k]
+        let mut pd: [f64] = []
+        let mut md: [f64] = []
+        let mut vd: [f64] = []
+        let mut i: int = 0
+        while i < p.data.len() is
+            let x: f64 = p.data[i]
+            let mut gi: f64 = g.data[i]
+            if o.kind != 3 && o.weight_decay != 0.0 is
+                gi = gi + o.weight_decay * x
+            end
+            let mut nx: f64 = x
+            let mut mi: f64 = m0[i]
+            let mut vi: f64 = v0[i]
+            if o.kind == 1 is
+                if o.momentum != 0.0 is
+                    mi = o.momentum * m0[i] + gi
+                    let d: f64 = if o.nesterov then gi + o.momentum * mi else mi end
+                    nx = x - o.lr * d
+                else is
+                    nx = x - o.lr * gi
+                end
+            elsif o.kind == 2 || o.kind == 3 is
+                mi = o.beta1 * m0[i] + (1.0 - o.beta1) * gi
+                vi = o.beta2 * v0[i] + (1.0 - o.beta2) * gi * gi
+                let mhat: f64 = mi / bc1
+                let vhat: f64 = vi / bc2
+                let base_x: f64 = if o.kind == 3 then x * (1.0 - o.lr * o.weight_decay) else x end
+                nx = base_x - o.lr * mhat / (math::sqrt(vhat) + o.eps)
+            elsif o.kind == 4 is
+                vi = o.momentum * v0[i] + (1.0 - o.momentum) * gi * gi
+                nx = x - o.lr * gi / (math::sqrt(vi) + o.eps)
+            else is
+                vi = v0[i] + gi * gi
+                nx = x - o.lr * gi / (math::sqrt(vi) + o.eps)
+            end
+            pd.push(nx)
+            md.push(mi)
+            vd.push(vi)
+            i += 1
+        end
+        out.push(tensor::Tensor { data: pd, shape: p.shape, op: 0, parents: [], aux: [], leaf: p.leaf })
+        nm.push(md)
+        nv.push(vd)
+        k += 1
+    end
+    let no: Optimizer = Optimizer {
+        kind: o.kind, lr: o.lr, momentum: o.momentum, beta1: o.beta1, beta2: o.beta2, eps: o.eps,
+        weight_decay: o.weight_decay, nesterov: o.nesterov, t: t, m: nm, v: nv,
+    }
+    return ParamsResult { params: out, opt: no }
+end
+
+;; one optimisation step on a Module (grads in the order of `model.parameters()`)
+pub fn step(o: Optimizer, model: nn::Module, grads: [tensor::Tensor]) -> StepResult is
+    let r: ParamsResult = step_params(o, nn::parameters(model), grads)
+    return StepResult { model: nn::with_parameters(model, r.params), opt: r.opt }
+end
+
+impl Optimizer is
+    fn step(self, model: nn::Module, grads: [tensor::Tensor]) -> StepResult is
+        return step(self, model, grads)
+    end
+
+    fn step_params(self, params: [tensor::Tensor], grads: [tensor::Tensor]) -> ParamsResult is
+        return step_params(self, params, grads)
+    end
+
+    fn with_lr(self, lr: f64) -> Optimizer is
+        return with_lr(self, lr)
+    end
+end
+
+;; ── learning-rate schedules: pure functions of the epoch / step ─────────────
+
+;; lr * gamma^(epoch / step_size)
+pub fn step_lr(base_lr: f64, epoch: int, step_size: int, gamma: f64) -> f64 is
+    return base_lr * math::pow(gamma, (epoch / step_size) as f64)
+end
+
+pub fn exp_lr(base_lr: f64, epoch: int, gamma: f64) -> f64 is
+    return base_lr * math::pow(gamma, epoch as f64)
+end
+
+;; cosine annealing from base_lr down to eta_min over t_max epochs
+pub fn cosine_lr(base_lr: f64, epoch: int, t_max: int, eta_min: f64) -> f64 is
+    let e: int = if epoch > t_max then t_max else epoch end
+    return eta_min + (base_lr - eta_min) * (1.0 + math::cos(3.141592653589793 * (e as f64) / (t_max as f64))) / 2.0
+end
+
+;; linear warm-up over `warmup` steps, then constant
+pub fn warmup_lr(base_lr: f64, step: int, warmup: int) -> f64 is
+    if step >= warmup is
+        return base_lr
+    end
+    return base_lr * ((step + 1) as f64) / (warmup as f64)
+end
