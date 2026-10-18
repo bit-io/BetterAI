@@ -1,0 +1,101 @@
+using "2026"
+use "bit -> betterai"
+use "std -> test" from "test"
+
+#[test]
+fn test_shapes_and_creation() is
+    let z: tensor::Tensor = tensor::zeros([2, 3])
+    assert_eq(z.numel(), 6)
+    assert_eq(tensor::ones([4]).sum().item(), 4.0)
+    assert_eq(tensor::eye(3).sum().item(), 3.0)
+    assert_approx(tensor::linspace(0.0, 1.0, 5).data[2], 0.5, 0.000001)
+    assert_eq(tensor::arange(5).data[4], 4.0)
+    assert_eq(tensor::from_rows([[1.0, 2.0], [3.0, 4.0]]).shape[1], 2)
+end
+
+#[test]
+fn test_broadcasting() is
+    let a: tensor::Tensor = tensor::from_rows([[1.0, 2.0], [3.0, 4.0]])
+    let row: tensor::Tensor = tensor::vector([10.0, 20.0])
+    let col: tensor::Tensor = tensor::from_rows([[100.0], [200.0]])
+    let s1: tensor::Tensor = a.add(row)
+    assert_eq(s1.data[0], 11.0)
+    assert_eq(s1.data[3], 24.0)
+    let s2: tensor::Tensor = a.add(col)
+    assert_eq(s2.data[1], 102.0)
+    assert_eq(s2.data[2], 203.0)
+    let s3: tensor::Tensor = a.mul(tensor::scalar(2.0))
+    assert_eq(s3.data[3], 8.0)
+end
+
+#[test]
+fn test_matmul_transpose() is
+    let a: tensor::Tensor = tensor::from_rows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    let p: tensor::Tensor = a.matmul(a.t())
+    assert_eq(p.shape[0], 2)
+    assert_eq(p.data[0], 14.0)
+    assert_eq(p.data[1], 32.0)
+    assert_eq(p.data[3], 77.0)
+end
+
+#[test]
+fn test_reshape_infers_dimension() is
+    let a: tensor::Tensor = tensor::arange(6)
+    let r: tensor::Tensor = a.reshape([2, -1])
+    assert_eq(r.shape[1], 3)
+    assert_eq(tensor::flatten(r).shape[0], 6)
+end
+
+#[test]
+fn test_reductions() is
+    let a: tensor::Tensor = tensor::from_rows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    assert_eq(a.sum().item(), 21.0)
+    assert_eq(a.mean().item(), 3.5)
+    let s0: tensor::Tensor = tensor::sum_axis(a, 0, false)
+    assert_eq(s0.shape[0], 3)
+    assert_eq(s0.data[2], 9.0)
+    let m1: tensor::Tensor = tensor::mean_axis(a, 1, true)
+    assert_eq(m1.shape[1], 1)
+    assert_eq(m1.data[1], 5.0)
+    assert_eq(tensor::argmax_rows(a)[0], 2)
+end
+
+#[test]
+fn test_softmax_rows_sum_to_one() is
+    let a: tensor::Tensor = tensor::from_rows([[1.0, 2.0, 3.0], [1000.0, 1000.0, 1000.0]])
+    let s: tensor::Tensor = tensor::softmax(a)
+    let r: tensor::Tensor = tensor::sum_axis(s, 1, false)
+    assert_approx(r.data[0], 1.0, 0.000001)
+    assert_approx(r.data[1], 1.0, 0.000001)
+    assert_approx(s.data[3], 0.3333333, 0.000001)
+end
+
+#[test]
+fn test_activations() is
+    let x: tensor::Tensor = tensor::vector([-1.0, 0.0, 2.0])
+    assert_eq(x.relu().data[0], 0.0)
+    assert_eq(x.relu().data[2], 2.0)
+    assert_approx(x.sigmoid().data[1], 0.5, 0.000001)
+    assert_approx(x.tanh().data[2], 0.9640275800758169, 0.000001)
+    assert_approx(tensor::leaky_relu(x, 0.1).data[0], -0.1, 0.000001)
+end
+
+#[test]
+fn test_random_is_deterministic_and_in_range() is
+    let a: tensor::Tensor = tensor::rand([50], 7)
+    let b: tensor::Tensor = tensor::rand([50], 7)
+    let c: tensor::Tensor = tensor::rand([50], 8)
+    assert_eq(a.data[10], b.data[10])
+    assert_true(a.data[10] != c.data[10])
+    for v in a.data is
+        assert_true(v >= 0.0 && v < 1.0)
+    end
+    let n: tensor::Tensor = tensor::randn([2000], 3)
+    assert_approx(n.mean().item(), 0.0, 0.1)
+end
+
+#[test]
+fn test_item_requires_one_element() is
+    assert_eq(tensor::scalar(3.0).item(), 3.0)
+    assert_eq(tensor::vector([7.0]).item(), 7.0)
+end
