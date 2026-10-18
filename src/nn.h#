@@ -1,0 +1,367 @@
+using "2026"
+
+;; ══════════════════════════════════════════════════════════════════════════
+;;  BetterAI · nn — layers and Module (torch.nn)
+;;
+;;      let model = nn::sequential([
+;;          nn::linear(2, 8, 1),
+;;          nn::relu(),
+;;          nn::linear(8, 1, 2),
+;;      ])
+;;      let y = model.forward(x)
+;;
+;;  A Layer is plain data: a `kind`, its parameter tensors and some
+;;  hyper-parameters. A Module is an ordered list of layers (nn.Sequential).
+;;  `sequential` numbers the parameters 0..n-1 (Tensor.leaf); a second model
+;;  that lives in the same graph (GAN, encoder/decoder, ...) uses
+;;  `sequential_at(layers, base)` so the ids do not collide.
+;;
+;;  Layer kinds:  1 linear   2 relu   3 sigmoid   4 tanh   5 leaky_relu
+;;                6 softmax  7 layer_norm   8 dropout   9 gelu   10 flatten
+;;                11 silu    12 softplus
+;;  Linear weights have shape [in, out]  (y = x · W + b), not PyTorch's [out, in].
+;; ══════════════════════════════════════════════════════════════════════════
+
+mod tensor
+mod functional
+
+use "std -> math" from "math"
+
+pub struct Layer is
+    pub kind: int
+    pub params: [tensor::Tensor]
+    pub hp: [f64]
+end
+
+pub struct Module is
+    pub layers: [Layer]
+    pub training: bool
+end
+
+;; ── layer constructors ──────────────────────────────────────────────────────
+
+;; fully connected layer; weights ~ U(-1/sqrt(in), 1/sqrt(in)) like PyTorch
+pub fn linear(n_in: int, n_out: int, seed: int) -> Layer is
+    let bound: f64 = 1.0 / math::sqrt(n_in as f64)
+    let w: tensor::Tensor = tensor::uniform([n_in, n_out], -bound, bound, seed * 2 + 1)
+    let b: tensor::Tensor = tensor::uniform([n_out], -bound, bound, seed * 2 + 2)
+    return Layer { kind: 1, params: [w, b], hp: [n_in as f64, n_out as f64] }
+end
+
+;; Xavier / Glorot-uniform weights, zero bias (good default for tanh / sigmoid)
+pub fn linear_xavier(n_in: int, n_out: int, seed: int) -> Layer is
+    let bound: f64 = math::sqrt(6.0 / ((n_in + n_out) as f64))
+    let w: tensor::Tensor = tensor::uniform([n_in, n_out], -bound, bound, seed * 2 + 1)
+    let b: tensor::Tensor = tensor::zeros([n_out])
+    return Layer { kind: 1, params: [w, b], hp: [n_in as f64, n_out as f64] }
+end
+
+;; Kaiming / He-uniform weights, zero bias (good default for relu)
+pub fn linear_kaiming(n_in: int, n_out: int, seed: int) -> Layer is
+    let bound: f64 = math::sqrt(6.0 / (n_in as f64))
+    let w: tensor::Tensor = tensor::uniform([n_in, n_out], -bound, bound, seed * 2 + 1)
+    let b: tensor::Tensor = tensor::zeros([n_out])
+    return Layer { kind: 1, params: [w, b], hp: [n_in as f64, n_out as f64] }
+end
+
+fn plain(kind: int, hp: [f64]) -> Layer is
+    return Layer { kind: kind, params: [], hp: hp }
+end
+
+pub fn relu() -> Layer is
+    return plain(2, [])
+end
+
+pub fn sigmoid() -> Layer is
+    return plain(3, [])
+end
+
+pub fn tanh() -> Layer is
+    return plain(4, [])
+end
+
+pub fn leaky_relu(alpha: f64) -> Layer is
+    return plain(5, [alpha])
+end
+
+pub fn softmax() -> Layer is
+    return plain(6, [])
+end
+
+pub fn gelu() -> Layer is
+    return plain(9, [])
+end
+
+pub fn flatten() -> Layer is
+    return plain(10, [])
+end
+
+pub fn silu() -> Layer is
+    return plain(11, [])
+end
+
+pub fn softplus() -> Layer is
+    return plain(12, [])
+end
+
+;; normalises the last axis, then applies learnable scale (gamma) and shift (beta)
+pub fn layer_norm(features: int) -> Layer is
+    return Layer {
+        kind: 7,
+        params: [tensor::ones([features]), tensor::zeros([features])],
+        hp: [0.00001],
+    }
+end
+
+;; randomly zeroes a fraction `p` of the activations while training
+pub fn dropout(p: f64, seed: int) -> Layer is
+    return plain(8, [p, seed as f64])
+end
+
+;; ── building a Module ───────────────────────────────────────────────────────
+
+;; Assigns leaf ids base, base+1, ... to every parameter, in layer order.
+pub fn sequential_at(layers: [Layer], base: int) -> Module is
+    let mut out: [Layer] = []
+    let mut next: int = base
+    for l in layers is
+        let mut ps: [tensor::Tensor] = []
+        for p in l.params is
+            ps.push(tensor::with_leaf(p, next))
+            next += 1
+        end
+        out.push(Layer { kind: l.kind, params: ps, hp: l.hp })
+    end
+    return Module { layers: out, training: true }
+end
+
+pub fn sequential(layers: [Layer]) -> Module is
+    return sequential_at(layers, 0)
+end
+
+;; convenience: an MLP  in -> hidden... -> out  with `act` (2 relu, 3 sigmoid, 4 tanh) between layers
+pub fn mlp(sizes: [int], act: int, seed: int) -> Module is
+    let mut layers: [Layer] = []
+    let mut i: int = 0
+    while i < sizes.len() - 1 is
+        if act == 2 is
+            layers.push(linear_kaiming(sizes[i], sizes[i + 1], seed + i))
+        else is
+            layers.push(linear_xavier(sizes[i], sizes[i + 1], seed + i))
+        end
+        if i < sizes.len() - 2 is
+            layers.push(plain(act, [0.01]))
+        end
+        i += 1
+    end
+    return sequential(layers)
+end
+
+;; ── forward pass ────────────────────────────────────────────────────────────
+
+fn apply_layer(l: Layer, x: tensor::Tensor, training: bool, seed: int) -> tensor::Tensor is
+    let k: int = l.kind
+    if k == 1 is
+        return tensor::add(tensor::matmul(x, l.params[0]), l.params[1])
+    end
+    if k == 2 is
+        return tensor::relu(x)
+    end
+    if k == 3 is
+        return tensor::sigmoid(x)
+    end
+    if k == 4 is
+        return tensor::tanh(x)
+    end
+    if k == 5 is
+        return tensor::leaky_relu(x, l.hp[0])
+    end
+    if k == 6 is
+        return tensor::softmax(x)
+    end
+    if k == 7 is
+        let n: tensor::Tensor = functional::normalize(x, l.hp[0])
+        return tensor::add(tensor::mul(n, l.params[0]), l.params[1])
+    end
+    if k == 8 is
+        if !training is
+            return x
+        end
+        return functional::dropout(x, l.hp[0], (l.hp[1] as int) + seed)
+    end
+    if k == 9 is
+        return functional::gelu(x)
+    end
+    if k == 10 is
+        return tensor::reshape(x, [x.shape[0], -1])
+    end
+    if k == 11 is
+        return functional::silu(x)
+    end
+    if k == 12 is
+        return functional::softplus(x)
+    end
+    panic("betterai: unknown layer kind " + to_string(k))
+    return x
+end
+
+;; run the module; `seed` varies the dropout masks (pass the step number)
+pub fn forward_seeded(m: Module, x: tensor::Tensor, seed: int) -> tensor::Tensor is
+    let mut h: tensor::Tensor = x
+    let mut i: int = 0
+    while i < m.layers.len() is
+        h = apply_layer(m.layers[i], h, m.training, seed * 131 + i)
+        i += 1
+    end
+    return h
+end
+
+pub fn forward(m: Module, x: tensor::Tensor) -> tensor::Tensor is
+    return forward_seeded(m, x, 0)
+end
+
+;; ── parameters ──────────────────────────────────────────────────────────────
+
+pub fn parameters(m: Module) -> [tensor::Tensor] is
+    let mut out: [tensor::Tensor] = []
+    for l in m.layers is
+        for p in l.params is
+            out.push(p)
+        end
+    end
+    return out
+end
+
+pub fn param_count(m: Module) -> int is
+    let mut n: int = 0
+    for p in parameters(m) is
+        n += p.data.len()
+    end
+    return n
+end
+
+;; a copy of the module whose parameters are `ps` (same order as `parameters`)
+pub fn with_parameters(m: Module, ps: [tensor::Tensor]) -> Module is
+    let mut out: [Layer] = []
+    let mut next: int = 0
+    for l in m.layers is
+        let mut np: [tensor::Tensor] = []
+        for p in l.params is
+            if next >= ps.len() is
+                panic("betterai: with_parameters: too few tensors")
+            end
+            np.push(tensor::with_leaf(ps[next], p.leaf))
+            next += 1
+        end
+        out.push(Layer { kind: l.kind, params: np, hp: l.hp })
+    end
+    if next != ps.len() is
+        panic("betterai: with_parameters: too many tensors")
+    end
+    return Module { layers: out, training: m.training }
+end
+
+pub fn train(m: Module) -> Module is
+    return Module { layers: m.layers, training: true }
+end
+
+pub fn eval(m: Module) -> Module is
+    return Module { layers: m.layers, training: false }
+end
+
+;; a copy without graph tracking (parameters lose their leaf ids) - for inference,
+;; like running under `torch.no_grad()`. Do not train or step this copy.
+pub fn detach(m: Module) -> Module is
+    let mut out: [Layer] = []
+    for l in m.layers is
+        let mut ps: [tensor::Tensor] = []
+        for p in l.params is
+            ps.push(tensor::detach(p))
+        end
+        out.push(Layer { kind: l.kind, params: ps, hp: l.hp })
+    end
+    return Module { layers: out, training: false }
+end
+
+;; forward pass in eval mode without recording a graph
+pub fn predict(m: Module, x: tensor::Tensor) -> tensor::Tensor is
+    return forward(detach(m), tensor::detach(x))
+end
+
+pub fn layer_name(kind: int) -> string is
+    if kind == 1 is
+        return "Linear"
+    elsif kind == 2 is
+        return "ReLU"
+    elsif kind == 3 is
+        return "Sigmoid"
+    elsif kind == 4 is
+        return "Tanh"
+    elsif kind == 5 is
+        return "LeakyReLU"
+    elsif kind == 6 is
+        return "Softmax"
+    elsif kind == 7 is
+        return "LayerNorm"
+    elsif kind == 8 is
+        return "Dropout"
+    elsif kind == 9 is
+        return "GELU"
+    elsif kind == 10 is
+        return "Flatten"
+    elsif kind == 11 is
+        return "SiLU"
+    end
+    return "Softplus"
+end
+
+pub fn summary(m: Module) -> string is
+    let mut s: string = "Sequential(\n"
+    let mut i: int = 0
+    while i < m.layers.len() is
+        let l: Layer = m.layers[i]
+        s = s + "  (" + to_string(i) + "): " + layer_name(l.kind)
+        if l.kind == 1 is
+            s = s + "(in=" + to_string(l.hp[0] as int) + ", out=" + to_string(l.hp[1] as int) + ")"
+        elsif l.kind == 8 is
+            s = s + "(p=" + to_string(l.hp[0]) + ")"
+        end
+        s = s + "\n"
+        i += 1
+    end
+    return s + ")  # " + to_string(param_count(m)) + " parameters"
+end
+
+impl Module is
+    fn forward(self, x: tensor::Tensor) -> tensor::Tensor is
+        return forward(self, x)
+    end
+
+    fn forward_seeded(self, x: tensor::Tensor, seed: int) -> tensor::Tensor is
+        return forward_seeded(self, x, seed)
+    end
+
+    fn parameters(self) -> [tensor::Tensor] is
+        return parameters(self)
+    end
+
+    fn param_count(self) -> int is
+        return param_count(self)
+    end
+
+    fn with_parameters(self, ps: [tensor::Tensor]) -> Module is
+        return with_parameters(self, ps)
+    end
+
+    fn train(self) -> Module is
+        return train(self)
+    end
+
+    fn eval(self) -> Module is
+        return eval(self)
+    end
+
+    fn summary(self) -> string is
+        return summary(self)
+    end
+end
