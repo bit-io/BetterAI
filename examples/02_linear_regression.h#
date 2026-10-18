@@ -1,0 +1,29 @@
+using "2026"
+use "bit -> betterai"
+
+;; Fit y = 3x + 1 by hand: parameters, loss, backward, optimizer - no nn module.
+
+fn main() is
+    let x: tensor::Tensor = tensor::from_rows([[0.0], [1.0], [2.0], [3.0], [4.0]])
+    let y: tensor::Tensor = tensor::from_rows([[1.0], [4.0], [7.0], [10.0], [13.0]])
+
+    let mut w: tensor::Tensor = tensor::param([0.0], [1, 1], 0)
+    let mut b: tensor::Tensor = tensor::param([0.0], [1], 1)
+    let mut opt: optim::Optimizer = optim::sgd(0.05, 0.0)
+
+    let mut epoch: int = 0
+    while epoch < 200 is
+        let pred: tensor::Tensor = x.matmul(w).add(b)
+        let loss: tensor::Tensor = functional::mse_loss(pred, y)
+        let grads: [tensor::Tensor] = autograd::backward(loss, [w, b])
+        let r: optim::ParamsResult = optim::step_params(opt, [w, b], grads)
+        w = r.params[0]
+        b = r.params[1]
+        opt = r.opt
+        if epoch % 50 == 0 is
+            write("epoch " + to_string(epoch) + "  loss " + to_string(tensor::round_to(loss.item(), 6)))
+        end
+        epoch += 1
+    end
+    write("learned  w = " + to_string(tensor::round_to(w.data[0], 3)) + "   b = " + to_string(tensor::round_to(b.data[0], 3)) + "   (target 3 and 1)")
+end
