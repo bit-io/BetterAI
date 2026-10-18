@@ -1,0 +1,37 @@
+using "2026"
+use "bit -> betterai"
+
+;; The classic: a small MLP learns XOR.
+;;   PyTorch                              BetterAI
+;;   model = nn.Sequential(...)           let mut model = nn::sequential([...])
+;;   opt = optim.Adam(model.parameters()) let mut opt = optim::adam(0.05)
+;;   loss.backward(); opt.step()          utils::train_step(model, opt, x, y, loss_kind, seed)
+
+fn main() is
+    let x: tensor::Tensor = tensor::from_rows([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+    let y: tensor::Tensor = tensor::from_rows([[0.0], [1.0], [1.0], [0.0]])
+
+    let mut model: nn::Module = nn::sequential([
+        nn::linear(2, 8, 1),
+        nn::tanh(),
+        nn::linear(8, 1, 2),
+    ])
+    let mut opt: optim::Optimizer = optim::adam(0.05)
+    write(model.summary())
+
+    let mut epoch: int = 0
+    while epoch < 300 is
+        let r: utils::TrainStep = utils::train_step(model, opt, x, y, 2, epoch)   ;; 2 = bce_with_logits
+        model = r.model
+        opt = r.opt
+        if epoch % 100 == 0 || epoch == 299 is
+            write("epoch " + to_string(epoch) + "  loss " + to_string(tensor::round_to(r.loss, 5)))
+        end
+        epoch += 1
+    end
+
+    let probs: tensor::Tensor = nn::predict(model, x).sigmoid()
+    write("predictions:")
+    write(probs.show())
+    write("accuracy: " + to_string(utils::binary_accuracy(probs, y, false)))
+end
