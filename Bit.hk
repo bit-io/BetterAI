@@ -1,0 +1,22 @@
+[package]
+-> name        => betterai
+-> version     => 0.1.0
+-> description => PyTorch-inspired machine learning library for H# - tensors, reverse-mode autograd, nn layers, optimizers and data loading
+-> license     => BSD-3
+-> lang        => h#
+
+[edition]
+-> edition   => 2026
+-> toolchain => 0.9
+
+[layout]
+-> src => src
+-> lib-entry => lib.h#
+
+[lib]
+-> output => hlib
+
+;; the tests import the library itself: `bit test` links this directory as "betterai"
+[dev-dependencies]
+-> betterai
+--> path => .
