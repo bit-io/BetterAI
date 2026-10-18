@@ -1,0 +1,59 @@
+using "2026"
+use "bit -> betterai"
+
+;; Three Gaussian blobs, a train/test split, shuffled mini-batches, a cosine
+;; learning-rate schedule, gradient clipping and an accuracy metric.
+
+fn make_blobs(per_class: int) -> data::Dataset is
+    let noise: tensor::Tensor = tensor::randn([per_class * 3, 2], 11)
+    let centers: [[f64]] = [[0.0, 0.0], [3.0, 3.0], [0.0, 4.0]]
+    let mut xs: [f64] = []
+    let mut ys: [f64] = []
+    let mut c: int = 0
+    while c < 3 is
+        let mut i: int = 0
+        while i < per_class is
+            let row: int = c * per_class + i
+            xs.push(centers[c][0] + 0.7 * noise.data[row * 2])
+            xs.push(centers[c][1] + 0.7 * noise.data[row * 2 + 1])
+            ys.push(c as f64)
+            i += 1
+        end
+        c += 1
+    end
+    return data::dataset(tensor::from_vec(xs, [per_class * 3, 2]), tensor::from_vec(ys, [per_class * 3]))
+end
+
+fn main() is
+    let all: data::Dataset = make_blobs(20)
+    let parts: data::Split = data::split(all, 0.8, 5)
+    write("train " + to_string(data::size(parts.train)) + " rows, test " + to_string(data::size(parts.test)) + " rows")
+
+    let mut model: nn::Module = nn::mlp([2, 16, 3], 2, 1)
+    let mut opt: optim::Optimizer = optim::adam(0.02)
+    let epochs: int = 40
+
+    let mut epoch: int = 0
+    while epoch < epochs is
+        opt = opt.with_lr(optim::cosine_lr(0.02, epoch, epochs, 0.001))
+        let batches: [data::Dataset] = data::batches(parts.train, 16, epoch)
+        let mut total: f64 = 0.0
+        for b in batches is
+            let out: tensor::Tensor = nn::forward_seeded(nn::train(model), b.x, epoch)
+            let loss: tensor::Tensor = functional::cross_entropy(out, data::labels(b.y))
+            let grads: [tensor::Tensor] = utils::clip_grad_norm(autograd::backward(loss, model.parameters()), 5.0)
+            let r: optim::StepResult = opt.step(model, grads)
+            model = r.model
+            opt = r.opt
+            total += loss.item()
+        end
+        if epoch % 10 == 0 || epoch == epochs - 1 is
+            let acc: f64 = utils::accuracy(nn::predict(model, parts.test.x), data::labels(parts.test.y))
+            write("epoch " + to_string(epoch) + "  train loss " + to_string(tensor::round_to(total / (batches.len() as f64), 4)) + "  test acc " + to_string(acc))
+        end
+        epoch += 1
+    end
+
+    utils::save_params("blobs.weights", model)
+    write("weights saved to blobs.weights")
+end
