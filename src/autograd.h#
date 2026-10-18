@@ -1,0 +1,341 @@
+using "2026"
+
+;; ══════════════════════════════════════════════════════════════════════════
+;;  BetterAI · autograd — reverse-mode automatic differentiation
+;;
+;;  PyTorch:   loss.backward();  w.grad
+;;  BetterAI:  let grads = autograd::backward(loss, n_params)   ;; grads[w.leaf]
+;;
+;;  Because H# values are copied, gradients cannot be written into the
+;;  parameters; they are returned as a list instead, indexed by `Tensor.leaf`.
+;;  Parameters that did not take part in the loss get an all-zero gradient.
+;;
+;;  The graph is walked recursively and every path from the loss to a parameter
+;;  contributes once, which is exact for any DAG. Networks are chains of layers,
+;;  so each node is visited once; a hand-written expression that reuses one
+;;  intermediate value in many branches is re-walked once per use.
+;; ══════════════════════════════════════════════════════════════════════════
+
+mod tensor
+
+use "std -> math" from "math"
+
+;; acc[idx] += g
+fn acc_add(acc: [[f64]], idx: int, g: [f64]) -> [[f64]] is
+    let mut out: [[f64]] = acc
+    if out[idx].len() == 0 is
+        out[idx] = g
+        return out
+    end
+    let cur: [f64] = out[idx]
+    let mut sum: [f64] = []
+    let mut i: int = 0
+    while i < g.len() is
+        sum.push(cur[i] + g[i])
+        i += 1
+    end
+    out[idx] = sum
+    return out
+end
+
+fn scaled(g: [f64], c: f64) -> [f64] is
+    let mut out: [f64] = []
+    for v in g is
+        out.push(v * c)
+    end
+    return out
+end
+
+fn negated(g: [f64]) -> [f64] is
+    return scaled(g, -1.0)
+end
+
+fn filled(n: int, v: f64) -> [f64] is
+    let mut out: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        out.push(v)
+        i += 1
+    end
+    return out
+end
+
+;; gradients flowing to each parent of `t`, given the gradient `g` of `t` itself
+;; (an empty list means "this parent gets nothing")
+fn local_grads(t: tensor::Tensor, g: [f64]) -> [[f64]] is
+    let op: int = t.op
+    let a: tensor::Tensor = t.parents[0]
+    let n: int = g.len()
+
+    ;; ── element-wise binary ops (with broadcasting) ────────────────────────
+    if op >= 1 && op <= 4 is
+        let b: tensor::Tensor = t.parents[1]
+        if op == 1 is
+            return [tensor::bred(g, t.shape, a.shape), tensor::bred(g, t.shape, b.shape)]
+        end
+        if op == 2 is
+            return [tensor::bred(g, t.shape, a.shape), negated(tensor::bred(g, t.shape, b.shape))]
+        end
+        let x: [f64] = tensor::bval(a.data, a.shape, t.shape)
+        let y: [f64] = tensor::bval(b.data, b.shape, t.shape)
+        let mut ga: [f64] = []
+        let mut gb: [f64] = []
+        let mut i: int = 0
+        while i < n is
+            if op == 3 is
+                ga.push(g[i] * y[i])
+                gb.push(g[i] * x[i])
+            else is
+                ga.push(g[i] / y[i])
+                gb.push(-g[i] * x[i] / (y[i] * y[i]))
+            end
+            i += 1
+        end
+        return [tensor::bred(ga, t.shape, a.shape), tensor::bred(gb, t.shape, b.shape)]
+    end
+
+    if op == 5 is
+        return [negated(g)]
+    end
+
+    if op == 6 is
+        let b: tensor::Tensor = t.parents[1]
+        let rows: int = a.shape[0]
+        let k: int = a.shape[1]
+        let m: int = b.shape[1]
+        ;; dA = g · Bᵀ      dB = Aᵀ · g
+        let ga: [f64] = tensor::mm_raw(g, tensor::transpose_raw(b.data, k, m), rows, m, k)
+        let gb: [f64] = tensor::mm_raw(tensor::transpose_raw(a.data, rows, k), g, k, rows, m)
+        return [ga, gb]
+    end
+
+    if op == 7 is
+        return [tensor::transpose_raw(g, t.shape[0], t.shape[1])]
+    end
+
+    if op == 8 is
+        return [filled(a.data.len(), g[0])]
+    end
+
+    if op == 9 is
+        return [filled(a.data.len(), g[0] / (a.data.len() as f64))]
+    end
+
+    if op == 10 is
+        ;; sum along an axis: every summed element receives the same gradient
+        let ax: int = t.aux[0] as int
+        let mut outer: int = 1
+        let mut inner: int = 1
+        let mut d: int = 0
+        while d < a.shape.len() is
+            if d < ax is
+                outer = outer * a.shape[d]
+            end
+            if d > ax is
+                inner = inner * a.shape[d]
+            end
+            d += 1
+        end
+        let dsz: int = a.shape[ax]
+        let mut ga: [f64] = []
+        let mut o: int = 0
+        while o < outer is
+            let mut k: int = 0
+            while k < dsz is
+                let mut q: int = 0
+                while q < inner is
+                    ga.push(g[o * inner + q])
+                    q += 1
+                end
+                k += 1
+            end
+            o += 1
+        end
+        return [ga]
+    end
+
+    if op == 17 is
+        return [g]
+    end
+
+    if op == 18 is
+        ;; softmax rows: y * (g - <g, y>)
+        let c: int = t.shape[t.shape.len() - 1]
+        let rows: int = n / c
+        let mut ga: [f64] = []
+        let mut i: int = 0
+        while i < rows is
+            let mut dot: f64 = 0.0
+            let mut j: int = 0
+            while j < c is
+                dot += g[i * c + j] * t.data[i * c + j]
+                j += 1
+            end
+            j = 0
+            while j < c is
+                ga.push(t.data[i * c + j] * (g[i * c + j] - dot))
+                j += 1
+            end
+            i += 1
+        end
+        return [ga]
+    end
+
+    if op == 19 is
+        ;; log_softmax rows: g - exp(y) * sum(g)
+        let c: int = t.shape[t.shape.len() - 1]
+        let rows: int = n / c
+        let mut ga: [f64] = []
+        let mut i: int = 0
+        while i < rows is
+            let mut sg: f64 = 0.0
+            let mut j: int = 0
+            while j < c is
+                sg += g[i * c + j]
+                j += 1
+            end
+            j = 0
+            while j < c is
+                ga.push(g[i * c + j] - math::exp(t.data[i * c + j]) * sg)
+                j += 1
+            end
+            i += 1
+        end
+        return [ga]
+    end
+
+    if op == 20 is
+        ;; nll: -g/rows at logp[i, target_i]
+        let rows: int = t.aux.len()
+        let c: int = a.data.len() / rows
+        let mut ga: [f64] = filled(a.data.len(), 0.0)
+        let mut i: int = 0
+        while i < rows is
+            ga[i * c + (t.aux[i] as int)] = -g[0] / (rows as f64)
+            i += 1
+        end
+        return [ga]
+    end
+
+    if op == 22 is
+        return [scaled(g, t.aux[0])]
+    end
+
+    if op == 23 is
+        return [g]
+    end
+
+    ;; ── element-wise unary ops: dx = g * f'(x) ─────────────────────────────
+    let mut ga: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        let x: f64 = a.data[i]
+        let y: f64 = t.data[i]
+        if op == 11 is
+            ga.push(if x > 0.0 then g[i] else 0.0 end)
+        elsif op == 12 is
+            ga.push(g[i] * y * (1.0 - y))
+        elsif op == 13 is
+            ga.push(g[i] * (1.0 - y * y))
+        elsif op == 14 is
+            ga.push(g[i] * y)
+        elsif op == 15 is
+            ga.push(g[i] / x)
+        elsif op == 16 is
+            let p: f64 = t.aux[0]
+            ga.push(g[i] * p * math::pow(x, p - 1.0))
+        elsif op == 21 is
+            ga.push(if x > 0.0 then g[i] else g[i] * t.aux[0] end)
+        elsif op == 24 is
+            ga.push(if x > 0.0 then g[i] elsif x < 0.0 then -g[i] else 0.0 end)
+        elsif op == 25 is
+            ga.push(if x >= t.aux[0] && x <= t.aux[1] then g[i] else 0.0 end)
+        else is
+            ga.push(g[i] / (2.0 * y))
+        end
+        i += 1
+    end
+    return [ga]
+end
+
+;; walk the graph from `t`, adding every parameter's gradient into `acc`
+pub fn backprop(t: tensor::Tensor, g: [f64], acc: [[f64]]) -> [[f64]] is
+    if t.leaf >= 0 is
+        if t.leaf < acc.len() is
+            return acc_add(acc, t.leaf, g)
+        end
+        return acc
+    end
+    if t.op == 0 is
+        return acc
+    end
+    let gl: [[f64]] = local_grads(t, g)
+    let mut cur: [[f64]] = acc
+    let mut k: int = 0
+    while k < t.parents.len() is
+        let p: tensor::Tensor = t.parents[k]
+        if tensor::tracks(p) && gl[k].len() > 0 is
+            cur = backprop(p, gl[k], cur)
+        end
+        k += 1
+    end
+    return cur
+end
+
+;; d(loss)/d(parameter) for every parameter whose `leaf` is below `n_params`.
+;; The result is indexed by leaf id and shaped like the parameter it belongs to
+;; (`params[i]` provides the shape for leaf `i`).
+pub fn backward_raw(loss: tensor::Tensor, n_params: int) -> [[f64]] is
+    if loss.data.len() != 1 is
+        panic("betterai: backward needs a scalar loss (got shape " + tensor::shape_str(loss.shape) + ") - reduce it with sum() or mean() first")
+    end
+    let mut acc: [[f64]] = []
+    let mut i: int = 0
+    while i < n_params is
+        acc.push([])
+        i += 1
+    end
+    return backprop(loss, [1.0], acc)
+end
+
+;; Gradients of a scalar `loss` with respect to `params`, in the same order.
+;; `params[i].leaf` must be unique and `< params.len()` ... or any ids you like:
+;; the lookup is by leaf id, so ids need not be 0..n-1.
+pub fn backward(loss: tensor::Tensor, params: [tensor::Tensor]) -> [tensor::Tensor] is
+    let mut maxid: int = -1
+    for p in params is
+        if p.leaf > maxid is
+            maxid = p.leaf
+        end
+    end
+    let raw: [[f64]] = backward_raw(loss, maxid + 1)
+    let mut out: [tensor::Tensor] = []
+    for p in params is
+        if p.leaf < 0 is
+            panic("betterai: backward: a tensor without a leaf id was passed as a parameter")
+        end
+        if raw[p.leaf].len() == 0 is
+            out.push(tensor::zeros_like(p))
+        else is
+            out.push(tensor::from_vec(raw[p.leaf], p.shape))
+        end
+    end
+    return out
+end
+
+;; numerical gradient check helper: central differences of `f(x)` where the
+;; function is given as a loss builder that already captured `x`.
+;; (used by the tests: perturb one element of `x` and compare)
+pub fn perturbed(x: tensor::Tensor, index: int, delta: f64) -> tensor::Tensor is
+    let mut d: [f64] = []
+    let mut i: int = 0
+    while i < x.data.len() is
+        if i == index is
+            d.push(x.data[i] + delta)
+        else is
+            d.push(x.data[i])
+        end
+        i += 1
+    end
+    return tensor::Tensor { data: d, shape: x.shape, op: 0, parents: [], aux: [], leaf: x.leaf }
+end
