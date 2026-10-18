@@ -1,0 +1,158 @@
+using "2026"
+use "bit -> betterai"
+use "std -> test" from "test"
+
+fn xor_x() -> tensor::Tensor is
+    return tensor::from_rows([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+end
+
+fn xor_y() -> tensor::Tensor is
+    return tensor::from_rows([[0.0], [1.0], [1.0], [0.0]])
+end
+
+;; fit y = 3x + 1 with the given optimizer and return the final loss
+fn fit_line(opt0: optim::Optimizer, epochs: int) -> f64 is
+    let x: tensor::Tensor = tensor::from_rows([[0.0], [1.0], [2.0], [3.0], [4.0]])
+    let y: tensor::Tensor = tensor::from_rows([[1.0], [4.0], [7.0], [10.0], [13.0]])
+    let mut model: nn::Module = nn::sequential([nn::linear(1, 1, 5)])
+    let mut opt: optim::Optimizer = opt0
+    let mut last: f64 = 0.0
+    let mut e: int = 0
+    while e < epochs is
+        let r: utils::TrainStep = utils::train_step(model, opt, x, y, 0, e)
+        model = r.model
+        opt = r.opt
+        last = r.loss
+        e += 1
+    end
+    return last
+end
+
+#[test]
+fn test_sgd_fits_a_line() is
+    assert_true(fit_line(optim::sgd(0.05, 0.0), 400) < 0.001)
+end
+
+#[test]
+fn test_sgd_momentum_fits_a_line() is
+    assert_true(fit_line(optim::sgd(0.02, 0.9), 300) < 0.001)
+end
+
+#[test]
+fn test_nesterov_fits_a_line() is
+    assert_true(fit_line(optim::sgd_nesterov(0.02, 0.9), 300) < 0.001)
+end
+
+#[test]
+fn test_adam_fits_a_line() is
+    assert_true(fit_line(optim::adam(0.1), 300) < 0.001)
+end
+
+#[test]
+fn test_adamw_fits_a_line() is
+    assert_true(fit_line(optim::adamw(0.1, 0.0001), 300) < 0.01)
+end
+
+#[test]
+fn test_rmsprop_fits_a_line() is
+    assert_true(fit_line(optim::rmsprop(0.02, 0.9), 400) < 0.05)
+end
+
+#[test]
+fn test_adagrad_reduces_loss() is
+    let before: f64 = fit_line(optim::adagrad(0.5), 1)
+    let after: f64 = fit_line(optim::adagrad(0.5), 200)
+    assert_true(after < before)
+end
+
+#[test]
+fn test_sgd_single_step_is_exact() is
+    let p: tensor::Tensor = tensor::param([1.0, 2.0], [2], 0)
+    let g: tensor::Tensor = tensor::vector([0.5, -1.0])
+    let r: optim::ParamsResult = optim::step_params(optim::sgd(0.1, 0.0), [p], [g])
+    assert_approx(r.params[0].data[0], 0.95, 0.0000001)
+    assert_approx(r.params[0].data[1], 2.1, 0.0000001)
+    assert_eq(r.params[0].leaf, 0)
+    assert_eq(r.opt.t, 1)
+end
+
+#[test]
+fn test_adam_first_step_moves_by_lr() is
+    ;; with bias correction the first Adam step is lr * sign(g)
+    let p: tensor::Tensor = tensor::param([0.0], [1], 0)
+    let g: tensor::Tensor = tensor::vector([4.0])
+    let r: optim::ParamsResult = optim::step_params(optim::adam(0.01), [p], [g])
+    assert_approx(r.params[0].data[0], -0.01, 0.000001)
+end
+
+#[test]
+fn test_mlp_learns_xor() is
+    let mut model: nn::Module = nn::mlp([2, 8, 1], 4, 3)
+    let mut opt: optim::Optimizer = optim::adam(0.05)
+    let mut e: int = 0
+    while e < 250 is
+        let r: utils::TrainStep = utils::train_step(model, opt, xor_x(), xor_y(), 2, e)
+        model = r.model
+        opt = r.opt
+        e += 1
+    end
+    let out: tensor::Tensor = nn::predict(model, xor_x())
+    assert_approx(utils::binary_accuracy(out, xor_y(), true), 1.0, 0.0001)
+end
+
+#[test]
+fn test_classifier_with_cross_entropy() is
+    ;; two well separated blobs
+    let x: tensor::Tensor = tensor::from_rows([[0.0, 0.1], [0.2, 0.0], [0.1, 0.2], [1.0, 1.1], [0.9, 1.0], [1.1, 0.9]])
+    let y: tensor::Tensor = tensor::vector([0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+    let mut model: nn::Module = nn::mlp([2, 6, 2], 4, 2)
+    let mut opt: optim::Optimizer = optim::adam(0.05)
+    let mut e: int = 0
+    while e < 150 is
+        let r: utils::TrainStep = utils::train_step(model, opt, x, y, 1, e)
+        model = r.model
+        opt = r.opt
+        e += 1
+    end
+    assert_approx(utils::accuracy(nn::predict(model, x), data::labels(y)), 1.0, 0.0001)
+end
+
+#[test]
+fn test_lr_schedules() is
+    assert_approx(optim::step_lr(0.1, 25, 10, 0.5), 0.025, 0.0000001)
+    assert_approx(optim::exp_lr(1.0, 3, 0.5), 0.125, 0.0000001)
+    assert_approx(optim::cosine_lr(1.0, 0, 10, 0.0), 1.0, 0.0000001)
+    assert_approx(optim::cosine_lr(1.0, 10, 10, 0.0), 0.0, 0.0000001)
+    assert_approx(optim::cosine_lr(1.0, 5, 10, 0.0), 0.5, 0.0000001)
+    assert_approx(optim::warmup_lr(0.1, 1, 4), 0.05, 0.0000001)
+    assert_approx(optim::warmup_lr(0.1, 9, 4), 0.1, 0.0000001)
+end
+
+#[test]
+fn test_clip_grad_norm() is
+    let g: tensor::Tensor = tensor::vector([3.0, 4.0])
+    assert_approx(utils::grad_norm([g]), 5.0, 0.000001)
+    let c: [tensor::Tensor] = utils::clip_grad_norm([g], 1.0)
+    assert_approx(utils::grad_norm(c), 1.0, 0.0001)
+    let same: [tensor::Tensor] = utils::clip_grad_norm([g], 10.0)
+    assert_eq(same[0].data[0], 3.0)
+end
+
+#[test]
+fn test_save_and_load_weights() is
+    let m: nn::Module = nn::mlp([2, 4, 1], 4, 11)
+    let text: string = utils::params_to_string(m)
+    let other: nn::Module = nn::mlp([2, 4, 1], 4, 77)
+    let loaded: nn::Module = utils::params_from_string(other, text)
+    let x: tensor::Tensor = tensor::rand([3, 2], 5)
+    let a: tensor::Tensor = nn::predict(m, x)
+    let b: tensor::Tensor = nn::predict(loaded, x)
+    assert_approx(a.data[0], b.data[0], 0.000000001)
+    assert_approx(a.data[2], b.data[2], 0.000000001)
+end
+
+#[test]
+fn test_r2_score_perfect_fit() is
+    let t: tensor::Tensor = tensor::vector([1.0, 2.0, 3.0])
+    assert_approx(utils::r2_score(t, t), 1.0, 0.000001)
+end
