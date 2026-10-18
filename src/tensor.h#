@@ -1,0 +1,977 @@
+using "2026"
+
+;; ══════════════════════════════════════════════════════════════════════════
+;;  BetterAI · tensor
+;;
+;;  A Tensor is an immutable n-dimensional array of f64 stored row-major.
+;;  Every differentiable operation also records a graph node (op code + the
+;;  parent tensors) so that `autograd::backward` can replay it in reverse.
+;;
+;;  Graph recording is automatic and cheap: a result only becomes a graph node
+;;  when at least one input is a parameter (leaf >= 0) or itself a graph node.
+;;  Pure data (inputs, targets, constants) never records anything — that is
+;;  BetterAI's equivalent of `torch.no_grad()`.
+;;
+;;  Op codes (Tensor.op):
+;;     0 leaf / constant        11 relu            21 leaky_relu
+;;     1 add                    12 sigmoid         22 mul_scalar
+;;     2 sub                    13 tanh            23 add_scalar
+;;     3 mul                    14 exp             24 abs
+;;     4 div                    15 log             25 clamp
+;;     5 neg                    16 pow             26 sqrt
+;;     6 matmul                 17 reshape
+;;     7 transpose              18 softmax (rows)
+;;     8 sum (all)              19 log_softmax (rows)
+;;     9 mean (all)             20 nll (mean over rows)
+;;    10 sum along an axis
+;; ══════════════════════════════════════════════════════════════════════════
+
+use "std -> math" from "math"
+
+pub struct Tensor is
+    pub data: [f64]
+    pub shape: [int]
+    pub op: int
+    pub parents: [Tensor]
+    pub aux: [f64]
+    pub leaf: int
+end
+
+;; ── shape helpers ───────────────────────────────────────────────────────────
+
+pub fn numel_of(shape: [int]) -> int is
+    let mut n: int = 1
+    for s in shape is
+        n = n * s
+    end
+    return n
+end
+
+pub fn shape_str(shape: [int]) -> string is
+    let mut s: string = "["
+    let mut i: int = 0
+    while i < shape.len() is
+        if i > 0 is
+            s = s + ", "
+        end
+        s = s + to_string(shape[i])
+        i += 1
+    end
+    return s + "]"
+end
+
+pub fn same_shape(a: [int], b: [int]) -> bool is
+    if a.len() != b.len() is
+        return false
+    end
+    let mut i: int = 0
+    while i < a.len() is
+        if a[i] != b[i] is
+            return false
+        end
+        i += 1
+    end
+    return true
+end
+
+;; numpy-style broadcasting of two shapes
+pub fn broadcast_shape(a: [int], b: [int]) -> [int] is
+    let na: int = a.len()
+    let nb: int = b.len()
+    let n: int = if na > nb then na else nb end
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < n is
+        let da: int = if i < n - na then 1 else a[i - (n - na)] end
+        let db: int = if i < n - nb then 1 else b[i - (n - nb)] end
+        if da != db && da != 1 && db != 1 is
+            panic("betterai: cannot broadcast shapes " + shape_str(a) + " and " + shape_str(b))
+        end
+        out.push(if da > db then da else db end)
+        i += 1
+    end
+    return out
+end
+
+;; for every flat index of `out` the flat index of the matching element of an
+;; input of shape `inp` that is broadcast to `out`
+pub fn bmap(out: [int], inp: [int]) -> [int] is
+    let nd: int = out.len()
+    let off: int = nd - inp.len()
+    let mut stv: [int] = []
+    let mut d: int = 0
+    while d < nd is
+        stv.push(0)
+        d += 1
+    end
+    let mut run: int = 1
+    d = nd - 1
+    while d >= off is
+        let isz: int = inp[d - off]
+        if isz != 1 is
+            stv[d] = run
+        end
+        run = run * isz
+        d -= 1
+    end
+    let total: int = numel_of(out)
+    let mut m: [int] = []
+    let mut i: int = 0
+    while i < total is
+        let mut rem: int = i
+        let mut src: int = 0
+        let mut k: int = nd - 1
+        while k >= 0 is
+            let c: int = rem % out[k]
+            rem = rem / out[k]
+            src += c * stv[k]
+            k -= 1
+        end
+        m.push(src)
+        i += 1
+    end
+    return m
+end
+
+;; sum `g` (laid out like the broadcast result) back into `n` input slots
+pub fn reduce_to(g: [f64], m: [int], n: int) -> [f64] is
+    let mut res: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        res.push(0.0)
+        i += 1
+    end
+    i = 0
+    while i < g.len() is
+        res[m[i]] = res[m[i]] + g[i]
+        i += 1
+    end
+    return res
+end
+
+;; gradient `g` of a broadcast result -> gradient of an input with shape `ishape`
+pub fn bred(g: [f64], oshape: [int], ishape: [int]) -> [f64] is
+    let n: int = numel_of(ishape)
+    if n == g.len() is
+        return g
+    end
+    return reduce_to(g, bmap(oshape, ishape), n)
+end
+
+;; the values of `x` expanded to the broadcast shape `oshape`
+pub fn bval(x: [f64], xshape: [int], oshape: [int]) -> [f64] is
+    if x.len() == numel_of(oshape) is
+        return x
+    end
+    let m: [int] = bmap(oshape, xshape)
+    let mut res: [f64] = []
+    let mut i: int = 0
+    while i < m.len() is
+        res.push(x[m[i]])
+        i += 1
+    end
+    return res
+end
+
+;; ── graph node construction ─────────────────────────────────────────────────
+
+pub fn tracks(t: Tensor) -> bool is
+    return t.leaf >= 0 || t.op != 0
+end
+
+pub fn mk(data: [f64], shape: [int], op: int, parents: [Tensor], aux: [f64]) -> Tensor is
+    let mut tr: bool = false
+    for p in parents is
+        if tracks(p) is
+            tr = true
+        end
+    end
+    if !tr is
+        return Tensor { data: data, shape: shape, op: 0, parents: [], aux: [], leaf: -1 }
+    end
+    return Tensor { data: data, shape: shape, op: op, parents: parents, aux: aux, leaf: -1 }
+end
+
+;; ── constructors ────────────────────────────────────────────────────────────
+
+pub fn from_vec(data: [f64], shape: [int]) -> Tensor is
+    if numel_of(shape) != data.len() is
+        panic("betterai: from_vec: " + to_string(data.len()) + " values do not fit shape " + shape_str(shape))
+    end
+    return Tensor { data: data, shape: shape, op: 0, parents: [], aux: [], leaf: -1 }
+end
+
+pub fn vector(data: [f64]) -> Tensor is
+    return from_vec(data, [data.len()])
+end
+
+;; build a 2-D tensor from rows: from_rows([[1.0, 2.0], [3.0, 4.0]])
+pub fn from_rows(rows: [[f64]]) -> Tensor is
+    let n: int = rows.len()
+    if n == 0 is
+        return from_vec([], [0, 0])
+    end
+    let c: int = rows[0].len()
+    let mut flat: [f64] = []
+    for r in rows is
+        if r.len() != c is
+            panic("betterai: from_rows: rows have different lengths")
+        end
+        for v in r is
+            flat.push(v)
+        end
+    end
+    return from_vec(flat, [n, c])
+end
+
+pub fn scalar(v: f64) -> Tensor is
+    return from_vec([v], [])
+end
+
+;; a trainable tensor. `leaf` is its slot in the gradient list that
+;; `autograd::backward` returns — give every parameter of one graph its own id.
+pub fn param(data: [f64], shape: [int], leaf: int) -> Tensor is
+    if numel_of(shape) != data.len() is
+        panic("betterai: param: data does not fit shape " + shape_str(shape))
+    end
+    return Tensor { data: data, shape: shape, op: 0, parents: [], aux: [], leaf: leaf }
+end
+
+pub fn with_leaf(t: Tensor, leaf: int) -> Tensor is
+    return Tensor { data: t.data, shape: t.shape, op: 0, parents: [], aux: [], leaf: leaf }
+end
+
+;; same values, no history, not trainable (torch's `.detach()`)
+pub fn detach(t: Tensor) -> Tensor is
+    return Tensor { data: t.data, shape: t.shape, op: 0, parents: [], aux: [], leaf: -1 }
+end
+
+pub fn full(shape: [int], v: f64) -> Tensor is
+    let n: int = numel_of(shape)
+    let mut d: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        d.push(v)
+        i += 1
+    end
+    return from_vec(d, shape)
+end
+
+pub fn zeros(shape: [int]) -> Tensor is
+    return full(shape, 0.0)
+end
+
+pub fn ones(shape: [int]) -> Tensor is
+    return full(shape, 1.0)
+end
+
+pub fn zeros_like(t: Tensor) -> Tensor is
+    return full(t.shape, 0.0)
+end
+
+pub fn ones_like(t: Tensor) -> Tensor is
+    return full(t.shape, 1.0)
+end
+
+;; 0, 1, ..., n-1
+pub fn arange(n: int) -> Tensor is
+    let mut d: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        d.push(i as f64)
+        i += 1
+    end
+    return from_vec(d, [n])
+end
+
+pub fn linspace(a: f64, b: f64, n: int) -> Tensor is
+    let mut d: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        if n == 1 is
+            d.push(a)
+        else is
+            d.push(a + (b - a) * (i as f64) / ((n - 1) as f64))
+        end
+        i += 1
+    end
+    return from_vec(d, [n])
+end
+
+pub fn eye(n: int) -> Tensor is
+    let mut d: [f64] = []
+    let mut i: int = 0
+    while i < n * n is
+        if i / n == i % n is
+            d.push(1.0)
+        else is
+            d.push(0.0)
+        end
+        i += 1
+    end
+    return from_vec(d, [n, n])
+end
+
+;; ── deterministic random numbers (LCG, no global state) ─────────────────────
+
+pub fn lcg_next(state: int) -> int is
+    return (state * 1103515245 + 12345) % 2147483648
+end
+
+;; n uniform samples in [0, 1) from `seed`
+pub fn rand_vec(n: int, seed: int) -> [f64] is
+    let mut s: int = lcg_next(lcg_next(seed + 7919))
+    let mut d: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        s = lcg_next(s)
+        d.push((s as f64) / 2147483648.0)
+        i += 1
+    end
+    return d
+end
+
+pub fn rand(shape: [int], seed: int) -> Tensor is
+    return from_vec(rand_vec(numel_of(shape), seed), shape)
+end
+
+pub fn uniform(shape: [int], lo: f64, hi: f64, seed: int) -> Tensor is
+    let u: [f64] = rand_vec(numel_of(shape), seed)
+    let mut d: [f64] = []
+    for v in u is
+        d.push(lo + (hi - lo) * v)
+    end
+    return from_vec(d, shape)
+end
+
+;; standard normal samples (Box-Muller)
+pub fn randn(shape: [int], seed: int) -> Tensor is
+    let n: int = numel_of(shape)
+    let u: [f64] = rand_vec(n * 2 + 2, seed)
+    let mut d: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        let u1: f64 = if u[2 * i] < 0.000001 then 0.000001 else u[2 * i] end
+        let u2: f64 = u[2 * i + 1]
+        d.push(math::sqrt(-2.0 * math::log(u1)) * math::cos(6.283185307179586 * u2))
+        i += 1
+    end
+    return from_vec(d, shape)
+end
+
+;; ── inspection ──────────────────────────────────────────────────────────────
+
+pub fn numel(t: Tensor) -> int is
+    return t.data.len()
+end
+
+pub fn ndim(t: Tensor) -> int is
+    return t.shape.len()
+end
+
+pub fn item(t: Tensor) -> f64 is
+    if t.data.len() != 1 is
+        panic("betterai: item() needs a tensor with exactly one element, got shape " + shape_str(t.shape))
+    end
+    return t.data[0]
+end
+
+pub fn get(t: Tensor, i: int) -> f64 is
+    return t.data[i]
+end
+
+pub fn get2(t: Tensor, r: int, c: int) -> f64 is
+    return t.data[r * t.shape[1] + c]
+end
+
+pub fn to_list(t: Tensor) -> [f64] is
+    return t.data
+end
+
+pub fn round_to(x: f64, decimals: int) -> f64 is
+    let k: f64 = math::pow(10.0, decimals as f64)
+    return math::round(x * k) / k
+end
+
+pub fn show(t: Tensor) -> string is
+    let mut s: string = "tensor("
+    if t.shape.len() == 2 is
+        s = s + "["
+        let r: int = t.shape[0]
+        let c: int = t.shape[1]
+        let mut i: int = 0
+        while i < r is
+            if i > 0 is
+                s = s + ",\n        "
+            end
+            s = s + "["
+            let mut j: int = 0
+            while j < c is
+                if j > 0 is
+                    s = s + ", "
+                end
+                s = s + to_string(round_to(t.data[i * c + j], 4))
+                j += 1
+            end
+            s = s + "]"
+            i += 1
+        end
+        s = s + "]"
+    else is
+        if t.shape.len() == 0 is
+            s = s + to_string(round_to(t.data[0], 4))
+        else is
+            s = s + "["
+            let mut i: int = 0
+            while i < t.data.len() is
+                if i > 0 is
+                    s = s + ", "
+                end
+                s = s + to_string(round_to(t.data[i], 4))
+                i += 1
+            end
+            s = s + "]"
+        end
+    end
+    if t.leaf >= 0 is
+        s = s + ", param=" + to_string(t.leaf)
+    elsif t.op != 0 is
+        s = s + ", grad_fn=op" + to_string(t.op)
+    end
+    return s + ")"
+end
+
+pub fn print(t: Tensor) is
+    write(show(t))
+end
+
+;; ── element-wise binary ops (with broadcasting) ─────────────────────────────
+
+fn binop(a: Tensor, b: Tensor, op: int) -> Tensor is
+    let oshape: [int] = broadcast_shape(a.shape, b.shape)
+    let x: [f64] = bval(a.data, a.shape, oshape)
+    let y: [f64] = bval(b.data, b.shape, oshape)
+    let mut out: [f64] = []
+    let mut i: int = 0
+    while i < x.len() is
+        if op == 1 is
+            out.push(x[i] + y[i])
+        elsif op == 2 is
+            out.push(x[i] - y[i])
+        elsif op == 3 is
+            out.push(x[i] * y[i])
+        else is
+            out.push(x[i] / y[i])
+        end
+        i += 1
+    end
+    return mk(out, oshape, op, [a, b], [])
+end
+
+pub fn add(a: Tensor, b: Tensor) -> Tensor is
+    return binop(a, b, 1)
+end
+
+pub fn sub(a: Tensor, b: Tensor) -> Tensor is
+    return binop(a, b, 2)
+end
+
+pub fn mul(a: Tensor, b: Tensor) -> Tensor is
+    return binop(a, b, 3)
+end
+
+pub fn div(a: Tensor, b: Tensor) -> Tensor is
+    return binop(a, b, 4)
+end
+
+pub fn neg(a: Tensor) -> Tensor is
+    let mut out: [f64] = []
+    for v in a.data is
+        out.push(-v)
+    end
+    return mk(out, a.shape, 5, [a], [])
+end
+
+pub fn mul_scalar(a: Tensor, c: f64) -> Tensor is
+    let mut out: [f64] = []
+    for v in a.data is
+        out.push(v * c)
+    end
+    return mk(out, a.shape, 22, [a], [c])
+end
+
+pub fn add_scalar(a: Tensor, c: f64) -> Tensor is
+    let mut out: [f64] = []
+    for v in a.data is
+        out.push(v + c)
+    end
+    return mk(out, a.shape, 23, [a], [c])
+end
+
+;; ── matrix ops ──────────────────────────────────────────────────────────────
+
+;; raw row-major kernels, also used by autograd
+pub fn mm_raw(x: [f64], y: [f64], n: int, k: int, m: int) -> [f64] is
+    let mut out: [f64] = []
+    let mut i: int = 0
+    while i < n is
+        let mut j: int = 0
+        while j < m is
+            let mut acc: f64 = 0.0
+            let mut p: int = 0
+            while p < k is
+                acc += x[i * k + p] * y[p * m + j]
+                p += 1
+            end
+            out.push(acc)
+            j += 1
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn transpose_raw(x: [f64], r: int, c: int) -> [f64] is
+    let mut out: [f64] = []
+    let mut j: int = 0
+    while j < c is
+        let mut i: int = 0
+        while i < r is
+            out.push(x[i * c + j])
+            i += 1
+        end
+        j += 1
+    end
+    return out
+end
+
+;; [n, k] x [k, m] -> [n, m]
+pub fn matmul(a: Tensor, b: Tensor) -> Tensor is
+    if a.shape.len() != 2 || b.shape.len() != 2 is
+        panic("betterai: matmul needs 2-D tensors, got " + shape_str(a.shape) + " and " + shape_str(b.shape) + " (use reshape for vectors)")
+    end
+    if a.shape[1] != b.shape[0] is
+        panic("betterai: matmul shape mismatch " + shape_str(a.shape) + " x " + shape_str(b.shape))
+    end
+    let n: int = a.shape[0]
+    let k: int = a.shape[1]
+    let m: int = b.shape[1]
+    return mk(mm_raw(a.data, b.data, n, k, m), [n, m], 6, [a, b], [])
+end
+
+pub fn transpose(a: Tensor) -> Tensor is
+    if a.shape.len() != 2 is
+        panic("betterai: transpose needs a 2-D tensor, got " + shape_str(a.shape))
+    end
+    return mk(transpose_raw(a.data, a.shape[0], a.shape[1]), [a.shape[1], a.shape[0]], 7, [a], [])
+end
+
+pub fn reshape(a: Tensor, shape: [int]) -> Tensor is
+    let n: int = a.data.len()
+    let mut known: int = 1
+    let mut unknown: int = -1
+    let mut i: int = 0
+    while i < shape.len() is
+        if shape[i] == -1 is
+            unknown = i
+        else is
+            known = known * shape[i]
+        end
+        i += 1
+    end
+    let mut sh: [int] = []
+    i = 0
+    while i < shape.len() is
+        if i == unknown is
+            sh.push(n / known)
+        else is
+            sh.push(shape[i])
+        end
+        i += 1
+    end
+    if numel_of(sh) != n is
+        panic("betterai: cannot reshape " + shape_str(a.shape) + " to " + shape_str(shape))
+    end
+    return mk(a.data, sh, 17, [a], [])
+end
+
+pub fn flatten(a: Tensor) -> Tensor is
+    return reshape(a, [-1])
+end
+
+;; ── reductions ──────────────────────────────────────────────────────────────
+
+pub fn sum(a: Tensor) -> Tensor is
+    let mut s: f64 = 0.0
+    for v in a.data is
+        s += v
+    end
+    return mk([s], [], 8, [a], [])
+end
+
+pub fn mean(a: Tensor) -> Tensor is
+    let mut s: f64 = 0.0
+    for v in a.data is
+        s += v
+    end
+    return mk([s / (a.data.len() as f64)], [], 9, [a], [])
+end
+
+;; sum along `axis` (negative axes count from the end)
+pub fn sum_axis(a: Tensor, axis: int, keepdim: bool) -> Tensor is
+    let nd: int = a.shape.len()
+    let ax: int = if axis < 0 then axis + nd else axis end
+    if ax < 0 || ax >= nd is
+        panic("betterai: sum_axis: axis " + to_string(axis) + " out of range for shape " + shape_str(a.shape))
+    end
+    let mut outer: int = 1
+    let mut inner: int = 1
+    let mut oshape: [int] = []
+    let mut i: int = 0
+    while i < nd is
+        if i < ax is
+            outer = outer * a.shape[i]
+        end
+        if i > ax is
+            inner = inner * a.shape[i]
+        end
+        if i != ax is
+            oshape.push(a.shape[i])
+        elsif keepdim is
+            oshape.push(1)
+        end
+        i += 1
+    end
+    let dsz: int = a.shape[ax]
+    let mut out: [f64] = []
+    let mut o: int = 0
+    while o < outer is
+        let mut q: int = 0
+        while q < inner is
+            let mut s: f64 = 0.0
+            let mut k: int = 0
+            while k < dsz is
+                s += a.data[(o * dsz + k) * inner + q]
+                k += 1
+            end
+            out.push(s)
+            q += 1
+        end
+        o += 1
+    end
+    return mk(out, oshape, 10, [a], [ax as f64])
+end
+
+pub fn mean_axis(a: Tensor, axis: int, keepdim: bool) -> Tensor is
+    let nd: int = a.shape.len()
+    let ax: int = if axis < 0 then axis + nd else axis end
+    let s: Tensor = sum_axis(a, ax, keepdim)
+    return mul_scalar(s, 1.0 / (a.shape[ax] as f64))
+end
+
+;; index of the largest value in every row of a [N, C] tensor (not differentiable)
+pub fn argmax_rows(a: Tensor) -> [int] is
+    let r: int = a.shape[0]
+    let c: int = a.shape[1]
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < r is
+        let mut best: int = 0
+        let mut j: int = 1
+        while j < c is
+            if a.data[i * c + j] > a.data[i * c + best] is
+                best = j
+            end
+            j += 1
+        end
+        out.push(best)
+        i += 1
+    end
+    return out
+end
+
+;; ── element-wise unary functions ────────────────────────────────────────────
+
+pub fn sigmoid_f(x: f64) -> f64 is
+    if x >= 0.0 is
+        return 1.0 / (1.0 + math::exp(-x))
+    end
+    let e: f64 = math::exp(x)
+    return e / (1.0 + e)
+end
+
+pub fn tanh_f(x: f64) -> f64 is
+    if x > 20.0 is
+        return 1.0
+    end
+    if x < -20.0 is
+        return -1.0
+    end
+    let e: f64 = math::exp(2.0 * x)
+    return (e - 1.0) / (e + 1.0)
+end
+
+fn unary(a: Tensor, op: int, aux: [f64]) -> Tensor is
+    let mut out: [f64] = []
+    for x in a.data is
+        if op == 11 is
+            out.push(if x > 0.0 then x else 0.0 end)
+        elsif op == 12 is
+            out.push(sigmoid_f(x))
+        elsif op == 13 is
+            out.push(tanh_f(x))
+        elsif op == 14 is
+            out.push(math::exp(x))
+        elsif op == 15 is
+            out.push(math::log(x))
+        elsif op == 16 is
+            out.push(math::pow(x, aux[0]))
+        elsif op == 21 is
+            out.push(if x > 0.0 then x else aux[0] * x end)
+        elsif op == 24 is
+            out.push(math::fabs(x))
+        elsif op == 25 is
+            out.push(math::fmin(math::fmax(x, aux[0]), aux[1]))
+        else is
+            out.push(math::sqrt(x))
+        end
+    end
+    return mk(out, a.shape, op, [a], aux)
+end
+
+pub fn relu(a: Tensor) -> Tensor is
+    return unary(a, 11, [])
+end
+
+pub fn sigmoid(a: Tensor) -> Tensor is
+    return unary(a, 12, [])
+end
+
+pub fn tanh(a: Tensor) -> Tensor is
+    return unary(a, 13, [])
+end
+
+pub fn exp(a: Tensor) -> Tensor is
+    return unary(a, 14, [])
+end
+
+pub fn log(a: Tensor) -> Tensor is
+    return unary(a, 15, [])
+end
+
+pub fn pow(a: Tensor, p: f64) -> Tensor is
+    return unary(a, 16, [p])
+end
+
+pub fn sqrt(a: Tensor) -> Tensor is
+    return unary(a, 26, [])
+end
+
+pub fn abs(a: Tensor) -> Tensor is
+    return unary(a, 24, [])
+end
+
+pub fn leaky_relu(a: Tensor, alpha: f64) -> Tensor is
+    return unary(a, 21, [alpha])
+end
+
+pub fn clamp(a: Tensor, lo: f64, hi: f64) -> Tensor is
+    return unary(a, 25, [lo, hi])
+end
+
+;; ── row-wise softmax family (over the last axis) ────────────────────────────
+
+fn row_split(a: Tensor) -> [int] is
+    let nd: int = a.shape.len()
+    if nd == 0 is
+        panic("betterai: softmax needs at least a 1-D tensor")
+    end
+    let c: int = a.shape[nd - 1]
+    return [a.data.len() / c, c]
+end
+
+pub fn softmax(a: Tensor) -> Tensor is
+    let rc: [int] = row_split(a)
+    let rows: int = rc[0]
+    let c: int = rc[1]
+    let mut out: [f64] = []
+    let mut i: int = 0
+    while i < rows is
+        let mut mx: f64 = a.data[i * c]
+        let mut j: int = 1
+        while j < c is
+            if a.data[i * c + j] > mx is
+                mx = a.data[i * c + j]
+            end
+            j += 1
+        end
+        let mut s: f64 = 0.0
+        j = 0
+        while j < c is
+            s += math::exp(a.data[i * c + j] - mx)
+            j += 1
+        end
+        j = 0
+        while j < c is
+            out.push(math::exp(a.data[i * c + j] - mx) / s)
+            j += 1
+        end
+        i += 1
+    end
+    return mk(out, a.shape, 18, [a], [])
+end
+
+pub fn log_softmax(a: Tensor) -> Tensor is
+    let rc: [int] = row_split(a)
+    let rows: int = rc[0]
+    let c: int = rc[1]
+    let mut out: [f64] = []
+    let mut i: int = 0
+    while i < rows is
+        let mut mx: f64 = a.data[i * c]
+        let mut j: int = 1
+        while j < c is
+            if a.data[i * c + j] > mx is
+                mx = a.data[i * c + j]
+            end
+            j += 1
+        end
+        let mut s: f64 = 0.0
+        j = 0
+        while j < c is
+            s += math::exp(a.data[i * c + j] - mx)
+            j += 1
+        end
+        let lse: f64 = mx + math::log(s)
+        j = 0
+        while j < c is
+            out.push(a.data[i * c + j] - lse)
+            j += 1
+        end
+        i += 1
+    end
+    return mk(out, a.shape, 19, [a], [])
+end
+
+;; negative log-likelihood: -mean_i logp[i, targets[i]]  (input = log-probabilities)
+pub fn nll(logp: Tensor, targets: [int]) -> Tensor is
+    let rc: [int] = row_split(logp)
+    let rows: int = rc[0]
+    let c: int = rc[1]
+    if targets.len() != rows is
+        panic("betterai: nll: " + to_string(targets.len()) + " targets for " + to_string(rows) + " rows")
+    end
+    let mut s: f64 = 0.0
+    let mut aux: [f64] = []
+    let mut i: int = 0
+    while i < rows is
+        if targets[i] < 0 || targets[i] >= c is
+            panic("betterai: nll: target " + to_string(targets[i]) + " out of range for " + to_string(c) + " classes")
+        end
+        s += logp.data[i * c + targets[i]]
+        aux.push(targets[i] as f64)
+        i += 1
+    end
+    return mk([-s / (rows as f64)], [], 20, [logp], aux)
+end
+
+;; ── tensor methods ──────────────────────────────────────────────────────────
+;;    (thin wrappers so that code reads like PyTorch: x.matmul(w).add(b).relu())
+
+impl Tensor is
+    fn add(self, o: Tensor) -> Tensor is
+        return add(self, o)
+    end
+
+    fn sub(self, o: Tensor) -> Tensor is
+        return sub(self, o)
+    end
+
+    fn mul(self, o: Tensor) -> Tensor is
+        return mul(self, o)
+    end
+
+    fn div(self, o: Tensor) -> Tensor is
+        return div(self, o)
+    end
+
+    fn neg(self) -> Tensor is
+        return neg(self)
+    end
+
+    fn matmul(self, o: Tensor) -> Tensor is
+        return matmul(self, o)
+    end
+
+    fn t(self) -> Tensor is
+        return transpose(self)
+    end
+
+    fn reshape(self, shape: [int]) -> Tensor is
+        return reshape(self, shape)
+    end
+
+    fn sum(self) -> Tensor is
+        return sum(self)
+    end
+
+    fn mean(self) -> Tensor is
+        return mean(self)
+    end
+
+    fn relu(self) -> Tensor is
+        return relu(self)
+    end
+
+    fn sigmoid(self) -> Tensor is
+        return sigmoid(self)
+    end
+
+    fn tanh(self) -> Tensor is
+        return tanh(self)
+    end
+
+    fn exp(self) -> Tensor is
+        return exp(self)
+    end
+
+    fn log(self) -> Tensor is
+        return log(self)
+    end
+
+    fn sqrt(self) -> Tensor is
+        return sqrt(self)
+    end
+
+    fn pow(self, p: f64) -> Tensor is
+        return pow(self, p)
+    end
+
+    fn softmax(self) -> Tensor is
+        return softmax(self)
+    end
+
+    fn scale(self, c: f64) -> Tensor is
+        return mul_scalar(self, c)
+    end
+
+    fn shift(self, c: f64) -> Tensor is
+        return add_scalar(self, c)
+    end
+
+    fn detach(self) -> Tensor is
+        return detach(self)
+    end
+
+    fn item(self) -> f64 is
+        return item(self)
+    end
+
+    fn numel(self) -> int is
+        return numel(self)
+    end
+
+    fn show(self) -> string is
+        return show(self)
+    end
+end
