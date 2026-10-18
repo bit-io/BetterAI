@@ -1,0 +1,131 @@
+using "2026"
+
+;; ══════════════════════════════════════════════════════════════════════════
+;;  BetterAI · data — Dataset and mini-batching (torch.utils.data)
+;;
+;;      let ds = data::dataset(x, y)                    ;; x: [N, features]
+;;      let parts = data::split(ds, 0.8, 42)            ;; parts.train / parts.test
+;;      let batches = data::batches(parts.train, 32, epoch)   ;; shuffled every epoch
+;;      for b in batches is  ...  b.x  b.y  end
+;; ══════════════════════════════════════════════════════════════════════════
+
+mod tensor
+
+pub struct Dataset is
+    pub x: tensor::Tensor
+    pub y: tensor::Tensor
+end
+
+pub struct Split is
+    pub train: Dataset
+    pub test: Dataset
+end
+
+pub fn dataset(x: tensor::Tensor, y: tensor::Tensor) -> Dataset is
+    if x.shape[0] != y.shape[0] is
+        panic("betterai: dataset: x has " + to_string(x.shape[0]) + " rows but y has " + to_string(y.shape[0]))
+    end
+    return Dataset { x: x, y: y }
+end
+
+pub fn size(ds: Dataset) -> int is
+    return ds.x.shape[0]
+end
+
+;; gather rows (first axis) of a tensor: result shape is [idx.len(), rest...]
+pub fn select_rows(t: tensor::Tensor, idx: [int]) -> tensor::Tensor is
+    let n: int = t.shape[0]
+    let width: int = t.data.len() / n
+    let mut d: [f64] = []
+    for r in idx is
+        if r < 0 || r >= n is
+            panic("betterai: select_rows: row " + to_string(r) + " out of range 0.." + to_string(n))
+        end
+        let mut j: int = 0
+        while j < width is
+            d.push(t.data[r * width + j])
+            j += 1
+        end
+    end
+    let mut sh: [int] = [idx.len()]
+    let mut k: int = 1
+    while k < t.shape.len() is
+        sh.push(t.shape[k])
+        k += 1
+    end
+    return tensor::from_vec(d, sh)
+end
+
+;; Fisher-Yates shuffle of 0..n-1; seed < 0 keeps the natural order
+pub fn permutation(n: int, seed: int) -> [int] is
+    let mut p: [int] = []
+    let mut i: int = 0
+    while i < n is
+        p.push(i)
+        i += 1
+    end
+    if seed < 0 is
+        return p
+    end
+    let u: [f64] = tensor::rand_vec(n, seed)
+    i = n - 1
+    while i > 0 is
+        let j: int = (u[i] * ((i + 1) as f64)) as int
+        let tmp: int = p[i]
+        p[i] = p[j]
+        p[j] = tmp
+        i -= 1
+    end
+    return p
+end
+
+pub fn subset(ds: Dataset, idx: [int]) -> Dataset is
+    return Dataset { x: select_rows(ds.x, idx), y: select_rows(ds.y, idx) }
+end
+
+;; split into mini-batches (the last one may be smaller). seed < 0: no shuffling.
+pub fn batches(ds: Dataset, batch_size: int, seed: int) -> [Dataset] is
+    let n: int = size(ds)
+    let perm: [int] = permutation(n, seed)
+    let mut out: [Dataset] = []
+    let mut start: int = 0
+    while start < n is
+        let mut idx: [int] = []
+        let mut k: int = start
+        while k < n && k < start + batch_size is
+            idx.push(perm[k])
+            k += 1
+        end
+        out.push(subset(ds, idx))
+        start += batch_size
+    end
+    return out
+end
+
+;; shuffle, then put the first `train_fraction` of the rows in `train`
+pub fn split(ds: Dataset, train_fraction: f64, seed: int) -> Split is
+    let n: int = size(ds)
+    let perm: [int] = permutation(n, seed)
+    let cut: int = ((n as f64) * train_fraction) as int
+    let mut a: [int] = []
+    let mut b: [int] = []
+    let mut i: int = 0
+    while i < n is
+        if i < cut is
+            a.push(perm[i])
+        else is
+            b.push(perm[i])
+        end
+        i += 1
+    end
+    return Split { train: subset(ds, a), test: subset(ds, b) }
+end
+
+;; class ids stored in a float tensor (shape [N] or [N, 1]) as ints
+pub fn labels(y: tensor::Tensor) -> [int] is
+    let mut out: [int] = []
+    for v in y.data is
+        out.push(v as int)
+    end
+    return out
+end
