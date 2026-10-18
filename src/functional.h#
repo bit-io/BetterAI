@@ -1,0 +1,141 @@
+using "2026"
+
+;; ══════════════════════════════════════════════════════════════════════════
+;;  BetterAI · functional — activations and losses (torch.nn.functional)
+;; ══════════════════════════════════════════════════════════════════════════
+
+mod tensor
+
+use "std -> math" from "math"
+
+;; ── activations ─────────────────────────────────────────────────────────────
+
+pub fn relu(x: tensor::Tensor) -> tensor::Tensor is
+    return tensor::relu(x)
+end
+
+pub fn leaky_relu(x: tensor::Tensor, alpha: f64) -> tensor::Tensor is
+    return tensor::leaky_relu(x, alpha)
+end
+
+pub fn sigmoid(x: tensor::Tensor) -> tensor::Tensor is
+    return tensor::sigmoid(x)
+end
+
+pub fn tanh(x: tensor::Tensor) -> tensor::Tensor is
+    return tensor::tanh(x)
+end
+
+pub fn softmax(x: tensor::Tensor) -> tensor::Tensor is
+    return tensor::softmax(x)
+end
+
+pub fn log_softmax(x: tensor::Tensor) -> tensor::Tensor is
+    return tensor::log_softmax(x)
+end
+
+;; log(1 + e^x), computed without overflow: relu(x) + log(1 + e^-|x|)
+pub fn softplus(x: tensor::Tensor) -> tensor::Tensor is
+    let e: tensor::Tensor = tensor::exp(tensor::neg(tensor::abs(x)))
+    return tensor::add(tensor::relu(x), tensor::log(tensor::add_scalar(e, 1.0)))
+end
+
+;; x * sigmoid(1.702 x)  (the usual fast GELU approximation)
+pub fn gelu(x: tensor::Tensor) -> tensor::Tensor is
+    return tensor::mul(x, tensor::sigmoid(tensor::mul_scalar(x, 1.702)))
+end
+
+;; x * sigmoid(x)
+pub fn silu(x: tensor::Tensor) -> tensor::Tensor is
+    return tensor::mul(x, tensor::sigmoid(x))
+end
+
+;; inverted dropout. `seed` picks the mask, so pass a different seed every step.
+;; With p = 0 (or in eval mode) the input is returned unchanged.
+pub fn dropout(x: tensor::Tensor, p: f64, seed: int) -> tensor::Tensor is
+    if p <= 0.0 is
+        return x
+    end
+    let u: [f64] = tensor::rand_vec(x.data.len(), seed)
+    let keep: f64 = 1.0 / (1.0 - p)
+    let mut mask: [f64] = []
+    for v in u is
+        mask.push(if v >= p then keep else 0.0 end)
+    end
+    return tensor::mul(x, tensor::from_vec(mask, x.shape))
+end
+
+;; one-hot encode class ids -> [N, classes]
+pub fn one_hot(targets: [int], classes: int) -> tensor::Tensor is
+    let mut d: [f64] = []
+    for t in targets is
+        let mut c: int = 0
+        while c < classes is
+            d.push(if c == t then 1.0 else 0.0 end)
+            c += 1
+        end
+    end
+    return tensor::from_vec(d, [targets.len(), classes])
+end
+
+;; layer norm over the last axis (no affine part; see nn::layer_norm for gamma/beta)
+pub fn normalize(x: tensor::Tensor, eps: f64) -> tensor::Tensor is
+    let last: int = x.shape.len() - 1
+    let mu: tensor::Tensor = tensor::mean_axis(x, last, true)
+    let centered: tensor::Tensor = tensor::sub(x, mu)
+    let var: tensor::Tensor = tensor::mean_axis(tensor::mul(centered, centered), last, true)
+    let std: tensor::Tensor = tensor::sqrt(tensor::add_scalar(var, eps))
+    return tensor::div(centered, std)
+end
+
+;; ── losses (all return a scalar tensor) ─────────────────────────────────────
+
+;; mean((pred - target)^2)
+pub fn mse_loss(pred: tensor::Tensor, target: tensor::Tensor) -> tensor::Tensor is
+    let d: tensor::Tensor = tensor::sub(pred, target)
+    return tensor::mean(tensor::mul(d, d))
+end
+
+;; mean(|pred - target|)
+pub fn l1_loss(pred: tensor::Tensor, target: tensor::Tensor) -> tensor::Tensor is
+    return tensor::mean(tensor::abs(tensor::sub(pred, target)))
+end
+
+;; smooth L1 / Huber loss with delta = 1
+pub fn huber_loss(pred: tensor::Tensor, target: tensor::Tensor) -> tensor::Tensor is
+    let d: tensor::Tensor = tensor::sub(pred, target)
+    let c: tensor::Tensor = tensor::clamp(d, -1.0, 1.0)
+    let quad: tensor::Tensor = tensor::mul_scalar(tensor::mul(c, c), 0.5)
+    let lin: tensor::Tensor = tensor::abs(tensor::sub(d, c))
+    return tensor::mean(tensor::add(quad, lin))
+end
+
+;; binary cross-entropy on probabilities in (0, 1)
+pub fn bce_loss(prob: tensor::Tensor, target: tensor::Tensor) -> tensor::Tensor is
+    let p: tensor::Tensor = tensor::clamp(prob, 0.0000001, 0.9999999)
+    let pos: tensor::Tensor = tensor::mul(target, tensor::log(p))
+    let one_minus_t: tensor::Tensor = tensor::add_scalar(tensor::neg(target), 1.0)
+    let one_minus_p: tensor::Tensor = tensor::add_scalar(tensor::neg(p), 1.0)
+    let negs: tensor::Tensor = tensor::mul(one_minus_t, tensor::log(one_minus_p))
+    return tensor::neg(tensor::mean(tensor::add(pos, negs)))
+end
+
+;; numerically stable binary cross-entropy on raw logits:
+;;   mean( relu(x) - x*y + log(1 + e^-|x|) )
+pub fn bce_with_logits(logits: tensor::Tensor, target: tensor::Tensor) -> tensor::Tensor is
+    let a: tensor::Tensor = tensor::relu(logits)
+    let b: tensor::Tensor = tensor::mul(logits, target)
+    let e: tensor::Tensor = tensor::exp(tensor::neg(tensor::abs(logits)))
+    let c: tensor::Tensor = tensor::log(tensor::add_scalar(e, 1.0))
+    return tensor::mean(tensor::add(tensor::sub(a, b), c))
+end
+
+;; negative log-likelihood of class ids given log-probabilities
+pub fn nll_loss(logp: tensor::Tensor, targets: [int]) -> tensor::Tensor is
+    return tensor::nll(logp, targets)
+end
+
+;; softmax + negative log-likelihood on raw logits [N, classes]
+pub fn cross_entropy(logits: tensor::Tensor, targets: [int]) -> tensor::Tensor is
+    return tensor::nll(tensor::log_softmax(logits), targets)
+end
