@@ -1,0 +1,194 @@
+using "2026"
+use "bit -> betterai"
+use "std -> test" from "test"
+
+;; Gradient check: compare the analytic gradient of autograd::backward with central
+;; finite differences for every element of x, for a loss built from many ops.
+
+fn side_w() -> tensor::Tensor is
+    return tensor::from_rows([[0.5, -1.0], [0.25, 2.0], [-0.75, 1.5]])
+end
+
+fn side_v() -> tensor::Tensor is
+    return tensor::vector([1.0, -2.0, 0.5])
+end
+
+fn side_c() -> tensor::Tensor is
+    return tensor::from_rows([[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]])
+end
+
+;; x has shape [2, 3]
+fn build(kase: int, x: tensor::Tensor) -> tensor::Tensor is
+    if kase == 0 is
+        return tensor::sum(tensor::mul(tensor::add(x, side_v()), tensor::sub(x, tensor::scalar(0.5))))
+    elsif kase == 1 is
+        return tensor::sum(tensor::div(x, tensor::add_scalar(tensor::mul(x, x), 1.0)))
+    elsif kase == 2 is
+        return tensor::sum(tensor::tanh(tensor::matmul(x, side_w())))
+    elsif kase == 3 is
+        return tensor::sum(tensor::mul(tensor::transpose(x), tensor::transpose(side_c())))
+    elsif kase == 4 is
+        return tensor::mean(tensor::sigmoid(x))
+    elsif kase == 5 is
+        return tensor::sum(tensor::log(tensor::add_scalar(tensor::exp(x), 1.0)))
+    elsif kase == 6 is
+        return tensor::sum(tensor::sqrt(tensor::add_scalar(tensor::pow(x, 2.0), 1.0)))
+    elsif kase == 7 is
+        return tensor::sum(tensor::mul(tensor::softmax(x), side_c()))
+    elsif kase == 8 is
+        return tensor::nll(tensor::log_softmax(x), [0, 2])
+    elsif kase == 9 is
+        let a: tensor::Tensor = tensor::mul(tensor::sum_axis(x, 0, false), side_v())
+        let b: tensor::Tensor = tensor::mul(tensor::mean_axis(x, 1, true), tensor::from_rows([[2.0], [-3.0]]))
+        return tensor::add(tensor::sum(a), tensor::sum(b))
+    elsif kase == 10 is
+        let a: tensor::Tensor = tensor::mul(tensor::leaky_relu(x, 0.1), x)
+        return tensor::add(tensor::sum(a), tensor::sum(tensor::add(tensor::abs(x), tensor::clamp(x, -0.5, 0.5))))
+    elsif kase == 11 is
+        return tensor::sum(tensor::mul(functional::normalize(x, 0.00001), side_c()))
+    elsif kase == 12 is
+        let t: tensor::Tensor = tensor::from_rows([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
+        return tensor::add(functional::bce_with_logits(x, t), functional::huber_loss(tensor::mul_scalar(x, 3.0), t))
+    elsif kase == 13 is
+        return tensor::sum(tensor::reshape(tensor::relu(tensor::neg(x)), [3, 2]))
+    end
+    return functional::cross_entropy(tensor::reshape(x, [2, 3]), [1, 0])
+end
+
+fn check(kase: int) is
+    let x0: tensor::Tensor = tensor::param([0.3, -0.7, 1.1, 0.9, -1.3, 0.4], [2, 3], 0)
+    let g: [tensor::Tensor] = autograd::backward(build(kase, x0), [x0])
+    let mut i: int = 0
+    while i < 6 is
+        let hi: f64 = build(kase, autograd::perturbed(x0, i, 0.00001)).data[0]
+        let lo: f64 = build(kase, autograd::perturbed(x0, i, -0.00001)).data[0]
+        let numeric: f64 = (hi - lo) / 0.00002
+        assert_approx(g[0].data[i], numeric, 0.0001)
+        i += 1
+    end
+end
+
+#[test]
+fn test_grad_broadcast_arith() is
+    check(0)
+end
+
+#[test]
+fn test_grad_div() is
+    check(1)
+end
+
+#[test]
+fn test_grad_matmul() is
+    check(2)
+end
+
+#[test]
+fn test_grad_transpose() is
+    check(3)
+end
+
+#[test]
+fn test_grad_sigmoid_mean() is
+    check(4)
+end
+
+#[test]
+fn test_grad_exp_log() is
+    check(5)
+end
+
+#[test]
+fn test_grad_pow_sqrt() is
+    check(6)
+end
+
+#[test]
+fn test_grad_softmax() is
+    check(7)
+end
+
+#[test]
+fn test_grad_log_softmax_nll() is
+    check(8)
+end
+
+#[test]
+fn test_grad_axis_reductions() is
+    check(9)
+end
+
+#[test]
+fn test_grad_leaky_abs_clamp() is
+    check(10)
+end
+
+#[test]
+fn test_grad_normalize() is
+    check(11)
+end
+
+#[test]
+fn test_grad_bce_huber() is
+    check(12)
+end
+
+#[test]
+fn test_grad_relu_reshape() is
+    check(13)
+end
+
+#[test]
+fn test_grad_cross_entropy() is
+    check(14)
+end
+
+#[test]
+fn test_grad_linear_regression_closed_form() is
+    let w: tensor::Tensor = tensor::param([2.0, 3.0], [2, 1], 0)
+    let b: tensor::Tensor = tensor::param([0.5], [1], 1)
+    let x: tensor::Tensor = tensor::from_rows([[1.0, 2.0], [3.0, 4.0]])
+    let y: tensor::Tensor = tensor::from_rows([[1.0], [2.0]])
+    let loss: tensor::Tensor = functional::mse_loss(x.matmul(w).add(b), y)
+    assert_approx(loss.item(), 164.25, 0.000001)
+    let g: [tensor::Tensor] = autograd::backward(loss, [w, b])
+    assert_approx(g[0].data[0], 57.0, 0.000001)
+    assert_approx(g[0].data[1], 81.0, 0.000001)
+    assert_approx(g[1].data[0], 24.0, 0.000001)
+end
+
+#[test]
+fn test_grad_shared_parameter_accumulates() is
+    ;; loss = sum(w*w) + sum(w) -> d/dw = 2w + 1
+    let w: tensor::Tensor = tensor::param([1.0, -2.0], [2], 0)
+    let loss: tensor::Tensor = tensor::add(tensor::sum(tensor::mul(w, w)), tensor::sum(w))
+    let g: [tensor::Tensor] = autograd::backward(loss, [w])
+    assert_approx(g[0].data[0], 3.0, 0.000001)
+    assert_approx(g[0].data[1], -3.0, 0.000001)
+end
+
+#[test]
+fn test_detach_blocks_gradient() is
+    let w: tensor::Tensor = tensor::param([2.0], [1], 0)
+    let loss: tensor::Tensor = tensor::sum(tensor::mul(tensor::detach(w), w))
+    let g: [tensor::Tensor] = autograd::backward(loss, [w])
+    ;; only the second factor is tracked: d/dw (c * w) = c = 2
+    assert_approx(g[0].data[0], 2.0, 0.000001)
+end
+
+#[test]
+fn test_unused_parameter_gets_zero_gradient() is
+    let a: tensor::Tensor = tensor::param([1.0], [1], 0)
+    let b: tensor::Tensor = tensor::param([5.0], [1], 1)
+    let g: [tensor::Tensor] = autograd::backward(tensor::sum(tensor::mul(a, a)), [a, b])
+    assert_approx(g[0].data[0], 2.0, 0.000001)
+    assert_approx(g[1].data[0], 0.0, 0.000001)
+end
+
+#[test]
+fn test_constants_record_no_graph() is
+    let a: tensor::Tensor = tensor::from_vec([1.0, 2.0], [2])
+    let c: tensor::Tensor = tensor::exp(tensor::add(a, a))
+    assert_eq(c.op, 0)
+    assert_eq(c.leaf, -1)
+end
