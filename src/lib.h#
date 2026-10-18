@@ -1,0 +1,31 @@
+using "2026"
+
+;; BetterAI — a PyTorch-inspired machine-learning library for H#.
+;;
+;;   use "bit -> betterai"
+;;
+;; The modules below are inlined into your program and are reachable by
+;; their plain names:
+;;
+;;   tensor      Tensor type, creation, shape ops, differentiable math
+;;   autograd    reverse-mode automatic differentiation (backward)
+;;   functional  activations and loss functions (the torch.nn.functional of BetterAI)
+;;   nn          layers (Linear, ReLU, LayerNorm, Dropout, ...) and Module (Sequential)
+;;   optim       SGD / Adam / AdamW / RMSprop / Adagrad + learning-rate schedules
+;;   data        Dataset, mini-batching, shuffling, train/test split
+;;   utils       metrics, gradient clipping, train_step, save / load of weights
+;;
+;; See README.md for the design notes (H# has value semantics, so tensors are
+;; immutable and optimizers return the updated model instead of mutating it).
+
+mod tensor
+mod autograd
+mod functional
+mod nn
+mod optim
+mod data
+mod utils
+
+pub fn version() -> string is
+    return "0.1.0"
+end
