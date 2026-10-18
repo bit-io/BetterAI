@@ -1,0 +1,100 @@
+using "2026"
+use "bit -> betterai"
+use "std -> test" from "test"
+
+#[test]
+fn test_sequential_assigns_leaf_ids() is
+    let m: nn::Module = nn::sequential([nn::linear(2, 3, 1), nn::relu(), nn::linear(3, 1, 2)])
+    let ps: [tensor::Tensor] = m.parameters()
+    assert_eq(ps.len(), 4)
+    assert_eq(ps[0].leaf, 0)
+    assert_eq(ps[3].leaf, 3)
+    assert_eq(m.param_count(), 2 * 3 + 3 + 3 * 1 + 1)
+    let m2: nn::Module = nn::sequential_at([nn::linear(2, 2, 3)], 10)
+    assert_eq(m2.parameters()[0].leaf, 10)
+    assert_eq(m2.parameters()[1].leaf, 11)
+end
+
+#[test]
+fn test_forward_shape() is
+    let m: nn::Module = nn::mlp([3, 5, 2], 2, 1)
+    let x: tensor::Tensor = tensor::rand([4, 3], 9)
+    let y: tensor::Tensor = m.forward(x)
+    assert_eq(y.shape[0], 4)
+    assert_eq(y.shape[1], 2)
+end
+
+#[test]
+fn test_layer_norm_normalises_rows() is
+    let m: nn::Module = nn::sequential([nn::layer_norm(4)])
+    let x: tensor::Tensor = tensor::from_rows([[1.0, 2.0, 3.0, 4.0], [10.0, 20.0, 30.0, 40.0]])
+    let y: tensor::Tensor = m.forward(x)
+    let mu: tensor::Tensor = tensor::mean_axis(y, 1, false)
+    assert_approx(mu.data[0], 0.0, 0.00001)
+    assert_approx(mu.data[1], 0.0, 0.00001)
+    assert_approx(y.data[0], y.data[4], 0.001)
+end
+
+#[test]
+fn test_dropout_train_vs_eval() is
+    let m: nn::Module = nn::sequential([nn::dropout(0.5, 1)])
+    let x: tensor::Tensor = tensor::ones([1, 200])
+    let tr: tensor::Tensor = m.forward(x)
+    let mut zeros: int = 0
+    for v in tr.data is
+        if v == 0.0 is
+            zeros += 1
+        end
+    end
+    assert_true(zeros > 50 && zeros < 150)
+    let ev: tensor::Tensor = m.eval().forward(x)
+    assert_eq(ev.sum().item(), 200.0)
+end
+
+#[test]
+fn test_with_parameters_keeps_structure() is
+    let m: nn::Module = nn::sequential([nn::linear(1, 1, 1)])
+    let w: tensor::Tensor = tensor::vector([0.0])
+    let m2: nn::Module = m.with_parameters([tensor::from_rows([[3.0]]), w])
+    let y: tensor::Tensor = m2.forward(tensor::from_rows([[2.0]]))
+    assert_eq(y.data[0], 6.0)
+    assert_eq(m2.parameters()[0].leaf, 0)
+end
+
+#[test]
+fn test_predict_records_no_graph() is
+    let m: nn::Module = nn::mlp([2, 3, 1], 4, 1)
+    let y: tensor::Tensor = nn::predict(m, tensor::rand([2, 2], 1))
+    assert_eq(y.op, 0)
+end
+
+#[test]
+fn test_cross_entropy_of_uniform_logits() is
+    let logits: tensor::Tensor = tensor::zeros([3, 4])
+    let l: tensor::Tensor = functional::cross_entropy(logits, [0, 1, 2])
+    assert_approx(l.item(), 1.3862943611198906, 0.000001)
+end
+
+#[test]
+fn test_losses() is
+    let p: tensor::Tensor = tensor::vector([1.0, 2.0, 3.0])
+    let t: tensor::Tensor = tensor::vector([1.0, 0.0, 5.0])
+    assert_approx(functional::mse_loss(p, t).item(), 8.0 / 3.0, 0.000001)
+    assert_approx(functional::l1_loss(p, t).item(), 4.0 / 3.0, 0.000001)
+    ;; huber(delta=1): d = [0, 2, -2] -> [0, 1.5, 1.5] -> mean 1.0
+    assert_approx(functional::huber_loss(p, t).item(), 1.0, 0.000001)
+    let logits: tensor::Tensor = tensor::vector([0.0, 0.0])
+    let y: tensor::Tensor = tensor::vector([1.0, 0.0])
+    assert_approx(functional::bce_with_logits(logits, y).item(), 0.6931471805599453, 0.000001)
+    assert_approx(functional::bce_loss(tensor::vector([0.5, 0.5]), y).item(), 0.6931471805599453, 0.000001)
+end
+
+#[test]
+fn test_softplus_and_one_hot() is
+    assert_approx(functional::softplus(tensor::vector([0.0])).data[0], 0.6931471805599453, 0.000001)
+    assert_approx(functional::softplus(tensor::vector([100.0])).data[0], 100.0, 0.000001)
+    let oh: tensor::Tensor = functional::one_hot([2, 0], 3)
+    assert_eq(oh.data[2], 1.0)
+    assert_eq(oh.data[3], 1.0)
+    assert_eq(oh.sum().item(), 2.0)
+end
